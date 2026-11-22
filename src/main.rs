@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use buf::{Pool, Scatter};
 use memmap2::Mmap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::{AcqRel, Acquire, Relaxed, Release}};
 use table::{uhash, AtomicMap, IdIndex};
 use buf::ZeroVec;
 use xxhash_rust::xxh3::xxh3_64;
@@ -155,6 +155,8 @@ pub struct Ctx {
     links: AtomicMap,
     /// root slot -> Ptr of its name
     comp_name: ZeroVec<AtomicU64>,
+    /// Set (Release) once `links` and `comp_name` are final; `person` only after.
+    linked: AtomicBool,
     qshift: u32,
     pub day0: i64,
     pub ndays: usize,
@@ -402,7 +404,7 @@ fn proc_stat() -> (u64, f64) {
 }
 
 /// Distinct keys in first-seen order, and for each line its key's position.
-fn dedup_keys(keys: &mut Vec<Vec<u8>>, seen: &mut hashbrown::HashMap<Vec<u8>, u32>, k: &[u8]) -> (u32, bool) {
+fn dedup_keys(keys: &mut Vec<Vec<u8>>, seen: &mut hashbrown::HashMap<Vec<u8>, u32, IdBuild>, k: &[u8]) -> (u32, bool) {
     if let Some(&i) = seen.get(k) {
         return (i, false);
     }
@@ -440,8 +442,8 @@ fn main() {
     let mut product_cat_raw: Vec<u32> = Vec::new();
     let mut cat_keys: Vec<Vec<u8>> = Vec::new();
     {
-        let mut seen_p = hashbrown::HashMap::new();
-        let mut seen_c = hashbrown::HashMap::new();
+        let mut seen_p = hashbrown::HashMap::default();
+        let mut seen_c = hashbrown::HashMap::default();
         read_small::<2>(&data_dir.join("products.csv"), |f| {
             let (_, new) = dedup_keys(&mut product_keys, &mut seen_p, f[0]);
             let (c, _) = dedup_keys(&mut cat_keys, &mut seen_c, f[1]);
@@ -467,7 +469,7 @@ fn main() {
     let mut campaign_ids = Vec::new();
     let mut channels: Vec<Vec<u8>> = Vec::new();
     {
-        let mut seen = hashbrown::HashMap::new();
+        let mut seen = hashbrown::HashMap::default();
         read_small::<2>(&data_dir.join("campaigns.csv"), |f| {
             if dedup_keys(&mut campaign_ids, &mut seen, f[0]).1 {
                 channels.push(f[1].to_vec());
@@ -518,27 +520,18 @@ fn main() {
             }
         }
     }
+    // Events first, then clicks (they need the links); largest first within each.
+    main_chunks.sort_by_key(|&(_, s, e, kind)| (kind, std::cmp::Reverse(e - s)));
+    let n_ev_tasks = main_chunks.iter().filter(|c| c.3 == 1).count();
     lap("setup");
 
-    // ---- links
+    // ---- links: tables sized by the number of link lines, which bounds the
+    // number of valid pairs. The work runs inside pass 1 (see the pool there).
     type LinkPair = (u64, u64, u64, u64); // (ha, pa, hb, pb)
-    let link_states: Vec<(Vec<LinkPair>, Vec<u64>)> = (0..nthreads).map(|_| (Vec::new(), Vec::new())).collect();
-    let link_states = par_run(link_states, link_chunks.len(), |(pairs, buf), t| {
-        let (fi, s, e, _) = link_chunks[t];
-        let m = &store.maps[fi];
-        let basep = m.as_ptr();
-        csv::scan::<2>(&m[s..e], buf, |f| {
-            if f[0].is_empty() || f[1].is_empty() {
-                return;
-            }
-            pairs.push((uhash(f[0]), store.ptr(fi, basep, f[0]), uhash(f[1]), store.ptr(fi, basep, f[1])));
-        });
-    });
-    let link_states: Vec<Vec<LinkPair>> = link_states.into_iter().map(|(p, _)| p).collect();
-    let nlinks: usize = link_states.iter().map(|v| v.len()).sum();
+    let nlines: usize = link_chunks.iter().map(|&(fi, s, e, _)| store.maps[fi][s..e].iter().filter(|&&b| b == b'\n').count() + 1).sum();
     // Concurrent union-find over slot indices of a concurrent ID table.
     // parent[x] == 0 means x is a root; otherwise parent[x] - 1 is its parent.
-    let idmap = AtomicMap::new(nlinks * 2 + 16);
+    let idmap = AtomicMap::new(nlines * 2 + 16);
     let cap = idmap.capacity();
     let parent: ZeroVec<AtomicU32> = ZeroVec::new(cap);
     let idptr: ZeroVec<AtomicU64> = ZeroVec::new(cap);
@@ -559,68 +552,7 @@ fn main() {
             x = gp as usize - 1;
         }
     }
-    const LINK_TASK: usize = 1 << 16;
-    let link_tasks: Vec<(usize, usize)> = link_states
-        .iter()
-        .enumerate()
-        .flat_map(|(v, pairs)| (0..pairs.len()).step_by(LINK_TASK).map(move |s| (v, s)))
-        .collect();
-    par_run((0..nthreads).map(|_| ()).collect(), link_tasks.len(), |_, t| {
-        let (v, s) = link_tasks[t];
-        let pairs = &link_states[v][s..(s + LINK_TASK).min(link_states[v].len())];
-        for (k, &(ha, pa, hb, pb)) in pairs.iter().enumerate() {
-            if let Some(&(h2, _, h3, _)) = pairs.get(k + PREFETCH) {
-                idmap.prefetch(h2);
-                idmap.prefetch(h3);
-            }
-            let (a, new_a) = idmap.insert(ha);
-            if new_a {
-                idptr[a].store(pa, Relaxed);
-            }
-            let (b, new_b) = idmap.insert(hb);
-            if new_b {
-                idptr[b].store(pb, Relaxed);
-            }
-            loop {
-                let ra = find(&parent, a);
-                let rb = find(&parent, b);
-                if ra == rb {
-                    break;
-                }
-                let (hi, lo) = if ra > rb { (ra, rb) } else { (rb, ra) };
-                if parent[hi].compare_exchange(0, lo as u32 + 1, Relaxed, Relaxed).is_ok() {
-                    break;
-                }
-            }
-        }
-    });
-    drop(link_states);
-    // Each ID's value becomes its root; each root's name is the byte-wise smallest ID.
     const SLOT_TASK: usize = 1 << 16;
-    let counts = par_run(vec![(0usize, 0usize); nthreads], cap.div_ceil(SLOT_TASK), |cnt, t| {
-        for i in t * SLOT_TASK..((t + 1) * SLOT_TASK).min(cap) {
-            if !idmap.occupied(i) {
-                continue;
-            }
-            cnt.0 += 1;
-            let r = find(&parent, i);
-            cnt.1 += (r == i) as usize;
-            idmap.set_val(i, r as u32);
-            let p = idptr[i].load(Relaxed);
-            let name = &comp_name[r];
-            let mut cur = name.load(Relaxed);
-            while cur == 0 || store.get(p) < store.get(cur) {
-                match name.compare_exchange(cur, p, Relaxed, Relaxed) {
-                    Ok(_) => break,
-                    Err(now) => cur = now,
-                }
-            }
-        }
-    });
-    let nid: usize = counts.iter().map(|c| c.0).sum();
-    let npeople: usize = counts.iter().map(|c| c.1).sum();
-    drop((parent, idptr));
-    lap(&format!("links: {nlinks} lines, {nid} ids, {npeople} people"));
 
     // Partition counts: about 8k event copies per event_id partition.
     let est_events = bytes[1] / 70 + 1024;
@@ -641,6 +573,7 @@ fn main() {
         channels,
         links: idmap,
         comp_name,
+        linked: AtomicBool::new(false),
         qshift: 64 - qb,
         day0,
         ndays,
@@ -658,6 +591,7 @@ fn main() {
         pend: Vec<(u64, K, P)>,
         pending: Vec<(u64, C1)>,
         buf: Vec<u64>,
+        pairs: Vec<LinkPair>,
         cpu: [f64; 3],
     }
     let s1: Vec<S1> = (0..nthreads)
@@ -668,14 +602,24 @@ fn main() {
             pend: Vec::with_capacity(BATCH),
             pending: Vec::new(),
             buf: Vec::new(),
+            pairs: Vec::new(),
             cpu: [0.0; 3],
         })
         .collect();
     /// Resolves the people of a batch of valid copies (their link slots were
-    /// prefetched when parsed) and scatters them.
+    /// prefetched when parsed) and scatters them. Until the links are done the
+    /// copies wait in `pend` (then many at once, prefetched again here).
     #[inline(always)]
     fn flush(ctx: &Ctx, pool: &Pool, pb: u32, pend: &mut Vec<(u64, K, P)>, k: &mut Scatter<K>, ev: &mut Scatter<P>) {
-        for &(uh, mut kr, mut pr) in pend.iter() {
+        if !ctx.linked.load(Acquire) {
+            return;
+        }
+        let n = pend.len();
+        for i in 0..n {
+            if n > BATCH && i + PREFETCH < n {
+                ctx.links.prefetch(pend[i + PREFETCH].0);
+            }
+            let (uh, mut kr, mut pr) = pend[i];
             pr.pkey = ctx.person(uh);
             let at = ev.push(pool, ctx.qpart(pr.pkey), pr);
             kr.w2 |= at as u64;
@@ -683,7 +627,7 @@ fn main() {
         }
         pend.clear();
     }
-    let s1 = par_run(s1, main_chunks.len(), |st, t| {
+    let chunk_task = |st: &mut S1, t: usize| {
         let (fi, s, e, kind) = main_chunks[t];
         let m = &store.maps[fi];
         let basep = m.as_ptr();
@@ -774,7 +718,150 @@ fn main() {
             }
         }
         buf::fence();
+    };
+
+    // One pool for pass 1. Priority: link work (parse + union per link chunk;
+    // then, once every chunk is in, naming) > clicks (they need the people) >
+    // events (parsed meanwhile; their copies wait in `pend` until the links
+    // are done, so no thread idles at the link phase barriers).
+    let link_next = AtomicUsize::new(0);
+    let link_done = AtomicUsize::new(0);
+    let unioned = AtomicBool::new(link_chunks.is_empty());
+    let name_next = AtomicUsize::new(0);
+    let name_done = AtomicUsize::new(0);
+    let n_name_tasks = cap.div_ceil(SLOT_TASK);
+    let main_next = [AtomicUsize::new(0), AtomicUsize::new(n_ev_tasks)];
+    let link_counts = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)]; // pairs, ids, people
+    let link_step = |st: &mut S1| -> bool {
+        let t = if link_next.load(Relaxed) < link_chunks.len() { link_next.fetch_add(1, Relaxed) } else { usize::MAX };
+        if t < link_chunks.len() {
+            let (fi, s, e, _) = link_chunks[t];
+            let m = &store.maps[fi];
+            let basep = m.as_ptr();
+            let pairs = &mut st.pairs;
+            pairs.clear();
+            csv::scan::<2>(&m[s..e], &mut st.buf, |f| {
+                if f[0].is_empty() || f[1].is_empty() {
+                    return;
+                }
+                pairs.push((uhash(f[0]), store.ptr(fi, basep, f[0]), uhash(f[1]), store.ptr(fi, basep, f[1])));
+            });
+            let idmap = &ctx.links;
+            for (k, &(ha, pa, hb, pb)) in pairs.iter().enumerate() {
+                if let Some(&(h2, _, h3, _)) = pairs.get(k + PREFETCH) {
+                    idmap.prefetch(h2);
+                    idmap.prefetch(h3);
+                }
+                let (a, new_a) = idmap.insert(ha);
+                if new_a {
+                    idptr[a].store(pa, Relaxed);
+                }
+                let (b, new_b) = idmap.insert(hb);
+                if new_b {
+                    idptr[b].store(pb, Relaxed);
+                }
+                loop {
+                    let ra = find(&parent, a);
+                    let rb = find(&parent, b);
+                    if ra == rb {
+                        break;
+                    }
+                    let (hi, lo) = if ra > rb { (ra, rb) } else { (rb, ra) };
+                    if parent[hi].compare_exchange(0, lo as u32 + 1, Relaxed, Relaxed).is_ok() {
+                        break;
+                    }
+                }
+            }
+            link_counts[0].fetch_add(pairs.len(), Relaxed);
+            if link_done.fetch_add(1, AcqRel) + 1 == link_chunks.len() {
+                unioned.store(true, Release);
+            }
+            return true;
+        }
+        if !unioned.load(Acquire) || name_next.load(Relaxed) >= n_name_tasks {
+            return false;
+        }
+        let t = name_next.fetch_add(1, Relaxed);
+        if t >= n_name_tasks {
+            return false;
+        }
+        // Each ID's value becomes its root; each root's name is the byte-wise smallest ID.
+        let (idmap, comp_name) = (&ctx.links, &ctx.comp_name);
+        let mut cnt = (0usize, 0usize);
+        for i in t * SLOT_TASK..((t + 1) * SLOT_TASK).min(cap) {
+            if !idmap.occupied(i) {
+                continue;
+            }
+            cnt.0 += 1;
+            let r = find(&parent, i);
+            cnt.1 += (r == i) as usize;
+            idmap.set_val(i, r as u32);
+            let p = idptr[i].load(Relaxed);
+            let name = &comp_name[r];
+            let mut cur = name.load(Relaxed);
+            while cur == 0 || store.get(p) < store.get(cur) {
+                match name.compare_exchange(cur, p, Relaxed, Relaxed) {
+                    Ok(_) => break,
+                    Err(now) => cur = now,
+                }
+            }
+        }
+        link_counts[1].fetch_add(cnt.0, Relaxed);
+        link_counts[2].fetch_add(cnt.1, Relaxed);
+        if name_done.fetch_add(1, AcqRel) + 1 == n_name_tasks {
+            let c: Vec<usize> = link_counts.iter().map(|c| c.load(Relaxed)).collect();
+            lap(&format!("links: {} lines, {} ids, {} people", c[0], c[1], c[2]));
+            ctx.linked.store(true, Release);
+        }
+        true
+    };
+    let s1: Vec<S1> = std::thread::scope(|sc| {
+        let hs: Vec<_> = s1
+            .into_iter()
+            .map(|mut st| {
+                let (link_step, chunk_task, main_next, ctx, pool, n_tasks) = (&link_step, &chunk_task, &main_next, &ctx, &pool, main_chunks.len());
+                sc.spawn(move || {
+                    let mut idle = 0u32;
+                    loop {
+                        if link_step(&mut st) {
+                            continue;
+                        }
+                        let linked = ctx.linked.load(Acquire);
+                        if linked {
+                            if !st.pend.is_empty() {
+                                let S1 { k, ev, pend, .. } = &mut st;
+                                flush(ctx, pool, pb, pend, k, ev);
+                                buf::fence();
+                            }
+                            let t = main_next[1].fetch_add(1, Relaxed);
+                            if t < n_tasks {
+                                chunk_task(&mut st, t);
+                                continue;
+                            }
+                        }
+                        let t = main_next[0].fetch_add(1, Relaxed);
+                        if t < n_ev_tasks {
+                            chunk_task(&mut st, t);
+                            continue;
+                        }
+                        if linked {
+                            break;
+                        }
+                        // Only clicks are left, and they wait for the links.
+                        idle += 1;
+                        if idle < 64 {
+                            std::hint::spin_loop();
+                        } else {
+                            std::thread::yield_now();
+                        }
+                    }
+                    st
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
+    drop((parent, idptr));
     let mut s1 = s1;
     for st in &mut s1 {
         st.k.finish();
