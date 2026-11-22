@@ -79,36 +79,55 @@ impl Pool {
     }
 }
 
+/// Records staged per part before being streamed out together.
+const G: usize = 8;
+
 /// One thread's partitioned append lists of `T`, as chains of pool blocks.
+/// Writes are combined: each part stages `G` records in cache, then streams
+/// them to their block with non-temporal stores (no read-for-ownership).
+/// `size_of::<T>()` must be a multiple of 8, so a group is whole cache lines.
 pub struct Scatter<T: Copy> {
-    /// Per part: the next write position; at `END` within a block when full.
+    /// Per part: the next record's final address; at `END` within a block when full.
     cur: Vec<*mut T>,
     /// Per part: its full blocks.
     full: Vec<Vec<*mut T>>,
+    /// Per part: the staged records of its current group.
+    stage: Vec<[T; G]>,
 }
 unsafe impl<T: Copy + Send> Send for Scatter<T> {}
 unsafe impl<T: Copy + Sync> Sync for Scatter<T> {}
 
-impl<T: Copy> Scatter<T> {
-    /// Records per block.
-    pub const PER: usize = (BLK - 1) / std::mem::size_of::<T>();
+impl<T: Copy + Default> Scatter<T> {
+    /// Records per block: whole groups, leaving at least one line spare.
+    pub const PER: usize = (BLK - 64) / (G * std::mem::size_of::<T>()) * G;
     const END: usize = Self::PER * std::mem::size_of::<T>();
 
     pub fn new(nparts: usize) -> Self {
+        assert!(std::mem::size_of::<T>() % 8 == 0);
         // A sentinel "full block" at address 0, so the first push allocates.
-        Scatter { cur: vec![Self::END as *mut T; nparts], full: (0..nparts).map(|_| Vec::new()).collect() }
+        Scatter {
+            cur: vec![Self::END as *mut T; nparts],
+            full: (0..nparts).map(|_| Vec::new()).collect(),
+            stage: vec![[T::default(); G]; nparts],
+        }
     }
 
-    /// Appends `v` to part `p`; returns where it was written.
+    /// Appends `v` to part `p`; returns where it will be once `finish`ed.
     #[inline(always)]
     pub fn push(&mut self, pool: &Pool, p: usize, v: T) -> *mut T {
         let mut c = unsafe { *self.cur.get_unchecked(p) };
-        if c as usize & (BLK - 1) == Self::END {
+        let off = c as usize & (BLK - 1);
+        if off == Self::END {
             c = self.refill(pool, p, c);
         }
+        let k = (off / std::mem::size_of::<T>()) % G;
         unsafe {
-            c.write(v);
+            let st = self.stage.get_unchecked_mut(p);
+            *st.get_unchecked_mut(k) = v;
             *self.cur.get_unchecked_mut(p) = c.add(1);
+            if k == G - 1 {
+                stream(st.as_ptr() as *const u8, c.sub(G - 1) as *mut u8, G * std::mem::size_of::<T>());
+            }
         }
         c
     }
@@ -121,6 +140,20 @@ impl<T: Copy> Scatter<T> {
             self.full[p].push(start);
         }
         pool.alloc() as *mut T
+    }
+
+    /// Writes out every partly staged group. Call before reading.
+    pub fn finish(&mut self) {
+        for p in 0..self.cur.len() {
+            let c = self.cur[p];
+            let off = c as usize & (BLK - 1);
+            let start = c as usize - off;
+            let k = (off / std::mem::size_of::<T>()) % G;
+            if start != 0 && k != 0 {
+                unsafe { std::ptr::copy_nonoverlapping(self.stage[p].as_ptr(), c.sub(k), k) };
+            }
+        }
+        fence();
     }
 
     /// The records of part `p`, as slices.
@@ -145,6 +178,41 @@ impl<T: Copy> Scatter<T> {
     pub fn total(&self) -> usize {
         (0..self.cur.len()).map(|p| self.len(p)).sum()
     }
+}
+
+/// Copies `n` bytes (a multiple of 64; `dst` 64-byte aligned) with
+/// non-temporal stores.
+#[inline(always)]
+unsafe fn stream(src: *const u8, dst: *mut u8, n: usize) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
+    {
+        use std::arch::x86_64::*;
+        let mut i = 0;
+        while i < n {
+            _mm256_stream_si256(dst.add(i) as *mut __m256i, _mm256_loadu_si256(src.add(i) as *const __m256i));
+            i += 32;
+        }
+    }
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx")))]
+    {
+        use std::arch::x86_64::*;
+        let mut i = 0;
+        while i < n {
+            _mm_stream_si128(dst.add(i) as *mut __m128i, _mm_loadu_si128(src.add(i) as *const __m128i));
+            i += 16;
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    std::ptr::copy_nonoverlapping(src, dst, n);
+}
+
+/// Orders this thread's non-temporal stores before its later stores.
+#[inline]
+pub fn fence() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_sfence()
+    };
 }
 
 /// A zero-initialised array of a type for which all-zero bytes is a valid
@@ -182,17 +250,20 @@ mod tests {
         let mut a: Scatter<[u64; 3]> = Scatter::new(5);
         let mut b: Scatter<u64> = Scatter::new(3);
         let mut want: Vec<Vec<u64>> = vec![Vec::new(); 5];
+        let mut ats = Vec::new();
         for i in 0..20_000u64 {
             let p = (i * 7 % 5) as usize;
             if p != 3 {
-                let at = a.push(&pool, p, [i, i + 1, i + 2]);
-                assert_eq!(unsafe { (*at)[0] }, i);
+                ats.push((a.push(&pool, p, [i, i + 1, i + 2]), i));
                 want[p].push(i);
             }
         }
         for i in 0..700_000u64 {
             b.push(&pool, (i % 3) as usize, i);
         }
+        a.finish();
+        b.finish();
+        assert!(ats.iter().all(|&(at, i)| unsafe { (*at)[0] } == i));
         for p in 0..5 {
             let got: Vec<u64> = a.blocks(p).flatten().map(|r| r[0]).collect();
             assert_eq!(got, want[p]);

@@ -768,7 +768,14 @@ fn main() {
                 st.cl.push(pool, ctx.qpart(c.pkey), c);
             }
         }
+        buf::fence();
     });
+    let mut s1 = s1;
+    for st in &mut s1 {
+        st.k.finish();
+        st.ev.finish();
+        st.cl.finish();
+    }
     let n_k: usize = s1.iter().map(|s| s.k.total()).sum();
     let n_p: usize = s1.iter().map(|s| s.ev.total()).sum();
     let n_c1: usize = s1.iter().map(|s| s.cl.total()).sum();
@@ -968,7 +975,7 @@ fn main() {
         st.cls = cls;
     });
 
-    fn each<T: Copy>(v: &[Scatter<T>], q: usize, mut f: impl FnMut(&T)) {
+    fn each<T: Copy + Default>(v: &[Scatter<T>], q: usize, mut f: impl FnMut(&T)) {
         for s in v {
             for b in s.blocks(q) {
                 for r in b {
