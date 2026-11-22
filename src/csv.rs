@@ -242,8 +242,8 @@ fn scan_block<'a, const N: usize>(data: &'a [u8], buf: &mut Vec<u64>, emit: &mut
         let block: &[u8; 64] = if bs + 64 <= n {
             unsafe { &*(data.as_ptr().add(bs) as *const [u8; 64]) }
         } else {
-            tail = [0u8; 64];
             tail[..n - bs].copy_from_slice(&data[bs..]);
+            tail[n - bs..].fill(0);
             &tail
         };
         let (sep, nl, quo) = masks(block);

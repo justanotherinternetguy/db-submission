@@ -201,6 +201,14 @@ pub struct URow {
     pub top: u32, // u32::MAX = null
 }
 
+/// Adds the elapsed time to a counter when dropped.
+struct Timer(*mut f64, Instant);
+impl Drop for Timer {
+    fn drop(&mut self) {
+        unsafe { *self.0 += self.1.elapsed().as_secs_f64() };
+    }
+}
+
 // ---------------------------------------------------------------- parallel helper
 
 fn par_run<S: Send, F: Fn(&mut S, usize) + Sync>(states: Vec<S>, ntasks: usize, f: F) -> Vec<S> {
@@ -568,10 +576,11 @@ fn main() {
         cl: Parts<C1>,
         pending: Vec<(u64, C1)>,
         buf: Vec<u64>,
+        cpu: [f64; 3],
     }
     let s1: Vec<S1> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..nthreads)
-            .map(|_| sc.spawn(|| S1 { ev: Parts::new(np, ev_cap), cl: Parts::new(nq, cl_cap), pending: Vec::new(), buf: Vec::new() }))
+            .map(|_| sc.spawn(|| S1 { ev: Parts::new(np, ev_cap), cl: Parts::new(nq, cl_cap), pending: Vec::new(), buf: Vec::new(), cpu: [0.0; 3] }))
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
@@ -580,6 +589,8 @@ fn main() {
         let m = &store.maps[fi];
         let basep = m.as_ptr();
         let ctx = &ctx;
+        let tk = Instant::now();
+        let _timer = Timer(&mut st.cpu[kind as usize] as *mut f64, tk);
         if kind == 1 {
             csv::scan::<7>(&m[s..e], &mut st.buf, |f| {
                 let eid = f[0];
@@ -658,7 +669,9 @@ fn main() {
     });
     let n_e1: usize = s1.iter().map(|s| s.ev.total()).sum();
     let n_c1: usize = s1.iter().map(|s| s.cl.total()).sum();
-    lap(&format!("pass 1: parse ({n_e1} event copies, {n_c1} valid clicks)"));
+    let cpu_ev: f64 = s1.iter().map(|s| s.cpu[1]).sum();
+    let cpu_cl: f64 = s1.iter().map(|s| s.cpu[2]).sum();
+    lap(&format!("pass 1: parse ({n_e1} event copies, {n_c1} valid clicks; cpu events {cpu_ev:.2}s clicks {cpu_cl:.2}s)"));
 
     // ---- pass 2: dedup events
     #[derive(Clone, Copy, Default)]
