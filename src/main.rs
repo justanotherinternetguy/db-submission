@@ -142,9 +142,8 @@ pub struct Ctx {
     we: i64,
     /// Base for the u32 relative timestamps: window_start - 7 days.
     base: i64,
+    /// product_id -> category rank (remapped)
     products: IdIndex,
-    /// product position -> category rank
-    product_cat: Vec<u16>,
     unknown_cat: u16,
     /// category names sorted byte-wise; index = rank
     pub categories: Vec<Vec<u8>>,
@@ -175,7 +174,7 @@ impl Ctx {
     #[inline]
     fn category(&self, product: &[u8], room: bool) -> u16 {
         match self.products.get_fast(product, room) {
-            Some(i) => self.product_cat[i as usize],
+            Some(c) => c as u16, // remapped to the category
             None => self.unknown_cat,
         }
     }
@@ -462,7 +461,8 @@ fn main() {
     let categories: Vec<Vec<u8>> = order.iter().map(|&c| cat_keys[c as usize].clone()).collect();
     let product_cat: Vec<u16> = product_cat_raw.iter().map(|&c| rank[c as usize]).collect();
     let unknown_cat = rank[cat_keys.iter().position(|k| k == b"unknown").unwrap()];
-    let products = IdIndex::build(&product_keys, b"p");
+    let mut products = IdIndex::build(&product_keys, b"p");
+    products.remap(&product_cat.iter().map(|&c| c as u32).collect::<Vec<_>>());
 
     let mut campaign_ids = Vec::new();
     let mut channels: Vec<Vec<u8>> = Vec::new();
@@ -633,7 +633,6 @@ fn main() {
         we,
         base,
         products,
-        product_cat,
         unknown_cat,
         categories,
         campaigns,
