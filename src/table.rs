@@ -177,3 +177,95 @@ impl IdIndex {
         }
     }
 }
+
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+
+#[repr(C)]
+struct ASlot {
+    key: AtomicU64,
+    val: AtomicU32,
+    _pad: u32,
+}
+
+/// Concurrent insert-only u64 -> slot-index table (non-zero keys), then a
+/// read-only u64 -> u32 map once values are set. Backed by huge pages.
+pub struct AtomicMap {
+    _region: crate::buf::Region,
+    slots: *const ASlot,
+    shift: u32,
+    mask: usize,
+}
+unsafe impl Send for AtomicMap {}
+unsafe impl Sync for AtomicMap {}
+
+impl AtomicMap {
+    /// `max_keys` must bound the number of distinct keys.
+    pub fn new(max_keys: usize) -> Self {
+        let bits = ((max_keys.max(8) * 2).next_power_of_two().trailing_zeros()).max(4);
+        let n = 1usize << bits;
+        let region = crate::buf::Region::new(n * std::mem::size_of::<ASlot>());
+        let slots = region.ptr() as *const ASlot; // zeroed by mmap
+        AtomicMap { _region: region, slots, shift: 64 - bits, mask: n - 1 }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.mask + 1
+    }
+
+    #[inline(always)]
+    fn slot(&self, i: usize) -> &ASlot {
+        unsafe { &*self.slots.add(i) }
+    }
+
+    #[inline(always)]
+    pub fn prefetch(&self, h: u64) {
+        prefetch(unsafe { self.slots.add((h >> self.shift) as usize) });
+    }
+
+    /// Slot index of `h`, inserting it if absent; true if this call inserted it.
+    #[inline]
+    pub fn insert(&self, h: u64) -> (usize, bool) {
+        let mut i = (h >> self.shift) as usize;
+        loop {
+            let s = self.slot(i);
+            let k = s.key.load(Relaxed);
+            if k == h {
+                return (i, false);
+            }
+            if k == 0 {
+                match s.key.compare_exchange(0, h, Relaxed, Relaxed) {
+                    Ok(_) => return (i, true),
+                    Err(now) if now == h => return (i, false),
+                    Err(_) => {}
+                }
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, h: u64) -> Option<u32> {
+        let mut i = (h >> self.shift) as usize;
+        loop {
+            let s = self.slot(i);
+            let k = s.key.load(Relaxed);
+            if k == h {
+                return Some(s.val.load(Relaxed));
+            }
+            if k == 0 {
+                return None;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    #[inline]
+    pub fn occupied(&self, i: usize) -> bool {
+        self.slot(i).key.load(Relaxed) != 0
+    }
+
+    #[inline]
+    pub fn set_val(&self, i: usize, v: u32) {
+        self.slot(i).val.store(v, Relaxed);
+    }
+}

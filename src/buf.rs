@@ -13,6 +13,10 @@ unsafe impl Sync for Region {}
 const HUGE: usize = 2 << 20;
 
 impl Region {
+    pub fn ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+
     pub fn new(bytes: usize) -> Region {
         let len = bytes.max(HUGE).div_ceil(HUGE) * HUGE + HUGE;
         unsafe {
@@ -97,5 +101,30 @@ impl<T: Copy> Parts<T> {
 
     pub fn total(&self) -> usize {
         (0..self.lens.len()).map(|p| self.len(p)).sum()
+    }
+}
+
+/// A zero-initialised array of a type for which all-zero bytes is a valid
+/// value (atomics, integers), backed by a huge-page-advised mapping.
+pub struct ZeroVec<T> {
+    _region: Region,
+    ptr: *const T,
+    len: usize,
+}
+unsafe impl<T: Sync> Send for ZeroVec<T> {}
+unsafe impl<T: Sync> Sync for ZeroVec<T> {}
+
+impl<T> ZeroVec<T> {
+    pub fn new(len: usize) -> Self {
+        let region = Region::new(len * std::mem::size_of::<T>());
+        let ptr = region.ptr() as *const T;
+        ZeroVec { _region: region, ptr, len }
+    }
+}
+
+impl<T> std::ops::Deref for ZeroVec<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }

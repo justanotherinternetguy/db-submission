@@ -24,7 +24,9 @@ use std::time::Instant;
 
 use buf::Parts;
 use memmap2::Mmap;
-use table::{prefetch, uhash, IdIndex, U64Map};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+use table::{uhash, AtomicMap, IdIndex};
+use buf::ZeroVec;
 use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
 
 pub const DAY: i64 = 86_400_000;
@@ -32,10 +34,6 @@ const GAP: u32 = 1_800_000;
 const WEEK: i64 = 7 * DAY;
 const LATE: i64 = DAY;
 
-const PB: u32 = 9; // event_id partitions = 2^PB
-const QB: u32 = 9; // person partitions = 2^QB
-const NP: usize = 1 << PB;
-const NQ: usize = 1 << QB;
 const CHUNK: usize = 4 << 20;
 const PREFETCH: usize = 16;
 
@@ -68,10 +66,6 @@ fn mix64(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-#[inline]
-fn qpart(pkey: u64) -> usize {
-    (mix64(pkey) >> (64 - QB)) as usize
-}
 
 // ---------------------------------------------------------------- byte store
 
@@ -129,10 +123,11 @@ pub struct Ctx {
     campaigns: IdIndex,
     pub campaign_ids: Vec<Vec<u8>>,
     pub channels: Vec<Vec<u8>>,
-    /// user_id hash -> component, for every ID named in a valid link line
-    links: U64Map,
-    /// component -> Ptr of its name
-    comp_name: Vec<u64>,
+    /// user_id hash -> component (root slot), for every ID named in a valid link line
+    links: AtomicMap,
+    /// root slot -> Ptr of its name
+    comp_name: ZeroVec<AtomicU64>,
+    qshift: u32,
     pub day0: i64,
     pub ndays: usize,
 }
@@ -144,6 +139,10 @@ impl Ctx {
             Some(c) => LINKED | c as u64,
             None => uh & !LINKED,
         }
+    }
+    #[inline]
+    fn qpart(&self, pkey: u64) -> usize {
+        (mix64(pkey) >> self.qshift) as usize
     }
     #[inline]
     fn category(&self, product: &[u8]) -> u16 {
@@ -450,65 +449,98 @@ fn main() {
         });
     });
     let nlinks: usize = link_states.iter().map(|v| v.len()).sum();
-    let mut idmap = U64Map::with_capacity(nlinks * 2 + 16);
-    let mut idptr: Vec<u64> = Vec::with_capacity(nlinks * 2);
-    let mut parent: Vec<u32> = Vec::with_capacity(nlinks * 2);
-    fn find(p: &mut [u32], mut x: u32) -> u32 {
-        while p[x as usize] != x {
-            let gp = p[p[x as usize] as usize];
-            p[x as usize] = gp;
-            x = gp;
+    // Concurrent union-find over slot indices of a concurrent ID table.
+    // parent[x] == 0 means x is a root; otherwise parent[x] - 1 is its parent.
+    let idmap = AtomicMap::new(nlinks * 2 + 16);
+    let cap = idmap.capacity();
+    let parent: ZeroVec<AtomicU32> = ZeroVec::new(cap);
+    let idptr: ZeroVec<AtomicU64> = ZeroVec::new(cap);
+    let comp_name: ZeroVec<AtomicU64> = ZeroVec::new(cap);
+    #[inline]
+    fn find(p: &[AtomicU32], mut x: usize) -> usize {
+        loop {
+            let px = p[x].load(Relaxed);
+            if px == 0 {
+                return x;
+            }
+            let up = px as usize - 1;
+            let gp = p[up].load(Relaxed);
+            if gp == 0 {
+                return up;
+            }
+            p[x].store(gp, Relaxed); // path halving: gp - 1 is an ancestor of x
+            x = gp as usize - 1;
         }
-        x
     }
-    for v in &link_states {
-        for &(ha, pa, hb, pb) in v {
-            let mut id = |h: u64, p: u64| -> u32 {
-                let (i, new) = idmap.get_or_insert(h, parent.len() as u32);
-                if new {
-                    idptr.push(p);
-                    parent.push(i);
+    const LINK_TASK: usize = 1 << 16;
+    let link_tasks: Vec<(usize, usize)> = link_states
+        .iter()
+        .enumerate()
+        .flat_map(|(v, pairs)| (0..pairs.len()).step_by(LINK_TASK).map(move |s| (v, s)))
+        .collect();
+    par_run((0..nthreads).map(|_| ()).collect(), link_tasks.len(), |_, t| {
+        let (v, s) = link_tasks[t];
+        let pairs = &link_states[v][s..(s + LINK_TASK).min(link_states[v].len())];
+        for (k, &(ha, pa, hb, pb)) in pairs.iter().enumerate() {
+            if let Some(&(h2, _, h3, _)) = pairs.get(k + PREFETCH) {
+                idmap.prefetch(h2);
+                idmap.prefetch(h3);
+            }
+            let (a, new_a) = idmap.insert(ha);
+            if new_a {
+                idptr[a].store(pa, Relaxed);
+            }
+            let (b, new_b) = idmap.insert(hb);
+            if new_b {
+                idptr[b].store(pb, Relaxed);
+            }
+            loop {
+                let ra = find(&parent, a);
+                let rb = find(&parent, b);
+                if ra == rb {
+                    break;
                 }
-                i
-            };
-            let a = id(ha, pa);
-            let b = id(hb, pb);
-            let ra = find(&mut parent, a);
-            let rb = find(&mut parent, b);
-            if ra != rb {
-                if ra < rb {
-                    parent[rb as usize] = ra;
-                } else {
-                    parent[ra as usize] = rb;
+                let (hi, lo) = if ra > rb { (ra, rb) } else { (rb, ra) };
+                if parent[hi].compare_exchange(0, lo as u32 + 1, Relaxed, Relaxed).is_ok() {
+                    break;
                 }
             }
         }
-    }
+    });
     drop(link_states);
-    // Components and their names (byte-wise smallest ID).
-    let nid = parent.len();
-    let mut comp_of_root = vec![u32::MAX; nid];
-    let mut comp_name: Vec<u64> = Vec::new();
-    let mut comp_of = vec![0u32; nid];
-    for i in 0..nid {
-        let r = find(&mut parent, i as u32) as usize;
-        if comp_of_root[r] == u32::MAX {
-            comp_of_root[r] = comp_name.len() as u32;
-            comp_name.push(idptr[i]);
-        } else {
-            let c = comp_of_root[r] as usize;
-            if store.get(idptr[i]) < store.get(comp_name[c]) {
-                comp_name[c] = idptr[i];
+    // Each ID's value becomes its root; each root's name is the byte-wise smallest ID.
+    const SLOT_TASK: usize = 1 << 16;
+    let counts = par_run(vec![(0usize, 0usize); nthreads], cap.div_ceil(SLOT_TASK), |cnt, t| {
+        for i in t * SLOT_TASK..((t + 1) * SLOT_TASK).min(cap) {
+            if !idmap.occupied(i) {
+                continue;
+            }
+            cnt.0 += 1;
+            let r = find(&parent, i);
+            cnt.1 += (r == i) as usize;
+            idmap.set_val(i, r as u32);
+            let p = idptr[i].load(Relaxed);
+            let name = &comp_name[r];
+            let mut cur = name.load(Relaxed);
+            while cur == 0 || store.get(p) < store.get(cur) {
+                match name.compare_exchange(cur, p, Relaxed, Relaxed) {
+                    Ok(_) => break,
+                    Err(now) => cur = now,
+                }
             }
         }
-        comp_of[i] = comp_of_root[r];
-    }
-    for v in idmap.values_mut() {
-        *v = comp_of[*v as usize];
-    }
-    drop((parent, comp_of, comp_of_root, idptr));
-    lap(&format!("links: {nlinks} lines, {nid} ids, {} people", comp_name.len()));
+    });
+    let nid: usize = counts.iter().map(|c| c.0).sum();
+    let npeople: usize = counts.iter().map(|c| c.1).sum();
+    drop((parent, idptr));
+    lap(&format!("links: {nlinks} lines, {nid} ids, {npeople} people"));
 
+    // Partition counts: about 8k event copies per event_id partition.
+    let est_events = bytes[1] / 70 + 1024;
+    let est_clicks = bytes[2] / 45 + 1024;
+    let pb: u32 = (usize::BITS - 1 - (est_events / 8000).max(16).leading_zeros()).min(14);
+    let qb: u32 = pb - 1;
+    let (np, nq) = (1usize << pb, 1usize << qb);
     let ctx = Ctx {
         ws,
         we,
@@ -522,15 +554,14 @@ fn main() {
         channels,
         links: idmap,
         comp_name,
+        qshift: 64 - qb,
         day0,
         ndays,
     };
 
     // ---- pass 1: events and clicks
-    let est_events = bytes[1] / 70 + 1024;
-    let est_clicks = bytes[2] / 45 + 1024;
-    let ev_cap = est_events / (nthreads * NP) * 13 / 10;
-    let cl_cap = est_clicks / (nthreads * NQ) * 13 / 10;
+    let ev_cap = est_events / (nthreads * np) * 13 / 10;
+    let cl_cap = est_clicks / (nthreads * nq) * 13 / 10;
     struct S1 {
         ev: Parts<E1>,
         cl: Parts<C1>,
@@ -538,7 +569,7 @@ fn main() {
     }
     let s1: Vec<S1> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..nthreads)
-            .map(|_| sc.spawn(|| S1 { ev: Parts::new(NP, ev_cap), cl: Parts::new(NQ, cl_cap), pending: Vec::new() }))
+            .map(|_| sc.spawn(|| S1 { ev: Parts::new(np, ev_cap), cl: Parts::new(nq, cl_cap), pending: Vec::new() }))
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
@@ -591,7 +622,7 @@ fn main() {
                     r.uhash = uhash(uid);
                     r.uptr = store.ptr(fi, basep, uid);
                 }
-                st.ev.push((r.eid >> (64 - PB)) as usize, r);
+                st.ev.push((r.eid >> (64 - pb)) as usize, r);
             });
         } else {
             st.pending.clear();
@@ -619,7 +650,7 @@ fn main() {
                 }
                 let (uh, mut c) = st.pending[i];
                 c.pkey = ctx.person(uh);
-                st.cl.push(qpart(c.pkey), c);
+                st.cl.push(ctx.qpart(c.pkey), c);
             }
         }
     });
@@ -635,7 +666,7 @@ fn main() {
         eid2: u32,
         loc: u32, // thread (5 bits) | index (27 bits); u32::MAX = empty
     }
-    let e2_cap = n_e1 / (nthreads * NQ) * 3 / 2 + 16;
+    let e2_cap = n_e1 / (nthreads * nq) * 3 / 2 + 16;
     struct S2 {
         out: Parts<E2>,
         table: Vec<DSlot>,
@@ -643,11 +674,11 @@ fn main() {
     }
     let s2: Vec<S2> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..nthreads)
-            .map(|_| sc.spawn(|| S2 { out: Parts::new(NQ, e2_cap), table: Vec::new(), winners: Vec::new() }))
+            .map(|_| sc.spawn(|| S2 { out: Parts::new(nq, e2_cap), table: Vec::new(), winners: Vec::new() }))
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    let s2 = par_run(s2, NP, |st, p| {
+    let s2 = par_run(s2, np, |st, p| {
         let n: usize = s1.iter().map(|s| s.ev.len(p)).sum();
         let size = (n * 2).next_power_of_two().max(16);
         let mask = size - 1;
@@ -687,7 +718,7 @@ fn main() {
             }
             let r = rec(w[i]);
             let pkey = ctx.person(r.uhash);
-            st.out.push(qpart(pkey), E2 { pkey, uptr: r.uptr, ts: r.ts, price: r.price, cat: r.cat as u32, _pad: 0 });
+            st.out.push(ctx.qpart(pkey), E2 { pkey, uptr: r.uptr, ts: r.ts, price: r.price, cat: r.cat as u32, _pad: 0 });
         }
         st.winners = w;
     });
@@ -727,7 +758,7 @@ fn main() {
             cats: Vec::new(),
         })
         .collect();
-    let s3 = par_run(s3, NQ, |st, q| {
+    let s3 = par_run(s3, nq, |st, q| {
         let n: usize = s2.iter().map(|s| s.out.len(q)).sum();
         if n == 0 {
             return;
@@ -852,7 +883,7 @@ fn main() {
 
     fn person(st: &mut S3, ctx: &Ctx, store: &Store, evs: &[E2], cls: &[C1], ncamp: usize) {
         let name = if evs[0].pkey & LINKED != 0 {
-            ctx.comp_name[(evs[0].pkey & !LINKED) as usize]
+            ctx.comp_name[(evs[0].pkey & !LINKED) as usize].load(Relaxed)
         } else {
             evs[0].uptr
         };
