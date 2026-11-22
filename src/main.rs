@@ -1393,8 +1393,9 @@ fn main() {
     }
     out::write_campaign_daily(&cd.join("part-000.parquet"), &camp_total, &ctx, ncamp).expect("write campaign_daily");
     lap("output");
-    // Exit without unmapping or freeing: the kernel does it faster.
-    std::process::exit(0);
+    // Exit without unmapping or freeing, after dropping the big mappings in parallel.
+    let inputs: Vec<(usize, usize)> = store.maps.iter().map(|m| (m.as_ptr() as usize, m.len())).collect();
+    buf::release_and_exit(nthreads, &inputs);
 }
 
 #[cfg(test)]

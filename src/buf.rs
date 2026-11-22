@@ -33,6 +33,7 @@ impl Region {
             libc::madvise(p, len, libc::MADV_HUGEPAGE);
             // Align the usable start to a huge page.
             let aligned = (p as usize).div_ceil(HUGE) * HUGE;
+            REGIONS.lock().unwrap().push((p as usize, len));
             Region { ptr: aligned as *mut u8, len: len - (aligned - p as usize) }
         }
     }
@@ -238,6 +239,40 @@ impl<T> std::ops::Deref for ZeroVec<T> {
     fn deref(&self) -> &[T] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
+}
+
+/// Every `Region` mapped so far, for `release_and_exit`.
+static REGIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Drops every `Region` and the `extra` ranges (the input mappings) with
+/// `MADV_DONTNEED` from `nthreads` threads, then exits at once. Exit teardown
+/// is single-threaded (and munmap serializes on mmap_lock); madvise holds the
+/// lock only shared, so this frees gigabytes several times faster. Nothing
+/// may touch those ranges afterwards: it ends the process.
+pub fn release_and_exit(nthreads: usize, extra: &[(usize, usize)]) -> ! {
+    const PIECE: usize = 64 << 20;
+    let mut pieces = Vec::new();
+    let regions = REGIONS.lock().unwrap().clone();
+    for &(a, len) in regions.iter().chain(extra) {
+        let b = a + len;
+        let mut s = a;
+        while s < b {
+            let e = (s + PIECE).min(b);
+            pieces.push((s, e));
+            s = e;
+        }
+    }
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|sc| {
+        for _ in 0..nthreads.max(1) {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, Relaxed);
+                let Some(&(a, b)) = pieces.get(i) else { break };
+                unsafe { libc::madvise(a as *mut libc::c_void, b - a, libc::MADV_DONTNEED) };
+            });
+        }
+    });
+    unsafe { libc::_exit(0) }
 }
 
 #[cfg(test)]
