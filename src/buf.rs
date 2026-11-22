@@ -272,7 +272,8 @@ pub fn release_and_exit(nthreads: usize, extra: &[(usize, usize)]) -> ! {
             });
         }
     });
-    unsafe { libc::_exit(0) }
+    // exit, not _exit: atexit handlers must run (the PGO-instrumented build writes its profile there).
+    std::process::exit(0)
 }
 
 #[cfg(test)]
