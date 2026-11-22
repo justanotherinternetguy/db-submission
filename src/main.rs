@@ -219,7 +219,7 @@ impl K {
 /// orders every F1 value exactly; unparseable sorts last.
 #[inline(always)]
 fn ingest_secs(s: &[u8]) -> u64 {
-    match ts::parse(s) {
+    match ts::parse_f1(s).or_else(|| ts::parse(s)) {
         Some(ms) => (ms.div_euclid(1000) + 62_167_219_200).clamp(0, M40 as i64 - 1) as u64,
         None => M40,
     }
