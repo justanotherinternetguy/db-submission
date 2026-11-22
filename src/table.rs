@@ -130,6 +130,8 @@ pub struct IdIndex {
     flat: Option<Vec<u32>>,
     map: hashbrown::HashMap<u64, u32, crate::IdBuild>,
     keys: Vec<Vec<u8>>,
+    /// After `remap`: key position -> value (empty: the position itself)
+    vals: Vec<u32>,
 }
 
 const MAX_FLAT: u64 = 1 << 24;
@@ -175,7 +177,20 @@ impl IdIndex {
         let mut pw = [0u8; 8];
         let pl = prefix.len().min(8);
         pw[..pl].copy_from_slice(&prefix[..pl]);
-        IdIndex { prefix: prefix.to_vec(), pword: u64::from_le_bytes(pw), flat, map, keys: keys.to_vec() }
+        IdIndex { prefix: prefix.to_vec(), pword: u64::from_le_bytes(pw), flat, map, keys: keys.to_vec(), vals: Vec::new() }
+    }
+
+    /// From now on lookups return `vals[position]` instead of the position
+    /// (one dependent load fewer on the flat path).
+    pub fn remap(&mut self, vals: &[u32]) {
+        assert_eq!(vals.len(), self.keys.len());
+        if let Some(t) = &mut self.flat {
+            for x in t.iter_mut().filter(|x| **x != u32::MAX) {
+                *x = vals[*x as usize];
+                assert!(*x != u32::MAX);
+            }
+        }
+        self.vals = vals.to_vec();
     }
 
     /// `get`, reading up to 8 bytes before the key's end when `room`.
@@ -219,7 +234,7 @@ impl IdIndex {
         }
         let &i = self.map.get(&xxh3_64(k))?;
         if self.keys[i as usize].as_slice() == k {
-            Some(i)
+            Some(if self.vals.is_empty() { i } else { self.vals[i as usize] })
         } else {
             None
         }
@@ -384,15 +399,21 @@ mod tests {
         for (prefix, n) in [(&b"p"[..], 50_000u32), (&b"c_"[..], 2000)] {
             let mut keys: Vec<Vec<u8>> = (0..n).map(|i| [prefix, (i * 3 + 1).to_string().as_bytes()].concat()).collect();
             keys.swap(0, 7);
+            if n == 2000 {
+                keys.push(b"c_007".to_vec()); // not canonical: forces the hash map
+            }
             let idx = IdIndex::build(&keys, prefix);
+            assert_eq!(idx.flat.is_some(), n != 2000);
             let oracle: std::collections::HashMap<Vec<u8>, u32> = keys.iter().enumerate().map(|(i, k)| (k.clone(), i as u32)).collect();
-            assert!(idx.flat.is_some());
             let alphabet = b"pc_0123456789P\"x\r ";
             let mut state = 0x1234_5678_9abc_def1u64;
             let mut next = || {
                 state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                 (state >> 33) as usize
             };
+            let vals: Vec<u32> = (0..keys.len() as u32).map(|i| i.wrapping_mul(2654435761) >> 7).collect();
+            let mut idx2 = IdIndex::build(&keys, prefix);
+            idx2.remap(&vals);
             for round in 0..400_000 {
                 let mut c: Vec<u8> = if round % 2 == 0 {
                     keys[next() % keys.len()].clone()
@@ -409,6 +430,9 @@ mod tests {
                 let f = &buf[16..16 + c.len()];
                 assert_eq!(idx.get_fast(f, true), idx.get(f), "{:?}", String::from_utf8_lossy(&c));
                 assert_eq!(idx.get(f), oracle.get(&c).copied());
+                let want = oracle.get(&c).map(|&i| vals[i as usize]);
+                assert_eq!(idx2.get_fast(f, true), want);
+                assert_eq!(idx2.get(f), want);
             }
         }
     }

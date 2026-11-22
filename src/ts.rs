@@ -39,6 +39,7 @@ fn days_in_month(y: i64, m: i64) -> i64 {
 }
 
 /// The straightforward parser; `parse` must agree with it on every input.
+#[allow(dead_code)]
 #[inline]
 pub fn parse_slow(s: &[u8]) -> Option<i64> {
     let n = s.len();
@@ -151,19 +152,19 @@ fn date(s: &[u8]) -> Option<i64> {
     let k = load8(s, 2);
     let c = load2(s, 0);
     let i = (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize;
-    DATES.with(|m| {
-        let e = unsafe { (*m.get()).get_unchecked(i) };
-        if e.k == k && e.c == c | VALID {
-            Some(e.days as i64)
-        } else {
-            date_miss(s, i, m)
-        }
-    })
+    // A trivial closure, so `with` inlines to a thread-pointer offset.
+    let m: *mut [DateSlot; 256] = DATES.with(|m| m.get());
+    let e = unsafe { (*m).get_unchecked(i) };
+    if e.k == k && e.c == c | VALID {
+        Some(e.days as i64)
+    } else {
+        date_miss(s, i, m)
+    }
 }
 
 #[cold]
 #[inline(never)]
-fn date_miss(s: &[u8], i: usize, m: &std::cell::UnsafeCell<[DateSlot; 256]>) -> Option<i64> {
+fn date_miss(s: &[u8], i: usize, m: *mut [DateSlot; 256]) -> Option<i64> {
     if s[4] != b'-' || s[7] != b'-' {
         return None;
     }
@@ -174,7 +175,7 @@ fn date_miss(s: &[u8], i: usize, m: &std::cell::UnsafeCell<[DateSlot; 256]>) -> 
         return None;
     }
     let days = days_from_civil(y, mo, d);
-    unsafe { (*m.get())[i] = DateSlot { k: load8(s, 2), c: load2(s, 0) | VALID, days: days as i32 } };
+    unsafe { (*m)[i] = DateSlot { k: load8(s, 2), c: load2(s, 0) | VALID, days: days as i32 } };
     Some(days)
 }
 
@@ -245,10 +246,16 @@ fn f3_slow(s: &[u8]) -> Option<i64> {
 /// F1 only (`YYYY-MM-DDTHH:MM:SSZ`), for `ingest_ts`; None for anything else.
 #[inline(always)]
 pub fn parse_f1(s: &[u8]) -> Option<i64> {
+    Some(f1_secs(s)? * 1000)
+}
+
+/// `parse_f1` in seconds.
+#[inline(always)]
+pub fn f1_secs(s: &[u8]) -> Option<i64> {
     if s.len() == 20 && s[10] == b'T' && s[19] == b'Z' {
         let tod = time_of_day(s)?;
         let d = date(s)?;
-        Some((d * 86_400 + tod) * 1000)
+        Some(d * 86_400 + tod)
     } else {
         None
     }
@@ -262,7 +269,9 @@ pub fn parse(s: &[u8]) -> Option<i64> {
             let a = load8(s, 0);
             let b = load8(s, 5);
             if digits8(a) & digits8(b) {
-                Some((value8(a) * 100_000 + value8(b) % 100_000) as i64)
+                // b holds digits 5..13; its first 3 are also in a.
+                let b = (b & !0xFF_FFFF) | 0x30_3030;
+                Some((value8(a) * 100_000 + value8(b)) as i64)
             } else {
                 None
             }
@@ -330,6 +339,7 @@ mod tests {
             assert_eq!(parse(&v), parse_slow(&v), "{:?}", String::from_utf8_lossy(&v));
             let f1 = if v.len() == 20 && v[19] == b'Z' { parse_slow(&v) } else { None };
             assert_eq!(super::parse_f1(&v), f1, "{:?}", String::from_utf8_lossy(&v));
+            assert_eq!(super::f1_secs(&v).map(|x| x * 1000), f1, "{:?}", String::from_utf8_lossy(&v));
         }
         // Every calendar day 1999..2031, and every offset.
         for days in days_from_civil(1999, 1, 1)..days_from_civil(2031, 1, 1) {

@@ -49,6 +49,8 @@ fn load(dir: &Path, mb: usize) -> Vec<u8> {
         let s = memchr::memchr(b'\n', &b).map_or(b.len(), |i| i + 1);
         v.extend_from_slice(&b[s..]);
         if v.len() > mb << 20 {
+            let cut = memchr::memchr(b'\n', &v[mb << 20..]).map_or(v.len(), |i| (mb << 20) + i + 1);
+            v.truncate(cut);
             break;
         }
     }
@@ -149,8 +151,9 @@ fn main() {
     let base = ws - 7 * 86_400_000;
     let prods = read_small(&dir.join("products.csv"));
     let pkeys: Vec<Vec<u8>> = prods.iter().map(|p| p.0.clone()).collect();
-    let products = table::IdIndex::build(&pkeys, b"p");
-    let pcat: Vec<u16> = (0..pkeys.len()).map(|i| (i % 20) as u16).collect();
+    let mut products = table::IdIndex::build(&pkeys, b"p");
+    products.remap(&(0..pkeys.len()).map(|i| (i % 20) as u32).collect::<Vec<_>>());
+    let pcat: Vec<u16> = (0..20).collect();
 
     let hdr = memchr::memchr(b'\n', &data).unwrap() + 1;
     let body = &data[hdr..];
@@ -244,11 +247,16 @@ fn main() {
         // records), minus the person lookup and scatter.
         const M40: u64 = (1 << 40) - 1;
         let ingest_secs = |s: &[u8]| -> u64 {
-            match ts::parse_f1(s).or_else(|| ts::parse(s)) {
-                Some(ms) => (ms.div_euclid(1000) + 62_167_219_200).clamp(0, M40 as i64 - 1) as u64,
-                None => M40,
-            }
+            let secs = match ts::f1_secs(s) {
+                Some(secs) => secs,
+                None => match ts::parse(s) {
+                    Some(ms) => ms.div_euclid(1000),
+                    None => return M40,
+                },
+            };
+            (secs + 62_167_219_200).clamp(0, M40 as i64 - 1) as u64
         };
+        let abl: u32 = std::env::var("ABL").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
         let mut keys: Vec<[u64; 3]> = Vec::with_capacity(lines + 16);
         let mut pend: Vec<(u64, [u64; 3], [u64; 3])> = Vec::with_capacity(lines + 16);
         bench("full", lines, reps, || {
@@ -260,43 +268,41 @@ fn main() {
                     if eid.is_empty() {
                         return;
                     }
-                    let h = table::ekey(eid);
-                    let ing = ingest_secs(f[3]);
+                    let h = if abl & 4 != 0 { eid.len() as u128 } else { table::ekey(eid) };
+                    let ing = if abl & 2 != 0 { 63_000_000_000 + f[3].len() as u64 } else { ingest_secs(f[3]) };
                     let kr = [(h as u64).max(1), (((h >> 64) as u64) << 40) | ing, ((h >> 88) as u64) << 48];
                     'v: {
                         let uid = f[1];
                         if uid.is_empty() {
                             break 'v;
                         }
-                        let t = match ts::parse(f[2]) {
+                        let t = if abl & 1 != 0 { ws + f[2].len() as i64 } else { match ts::parse(f[2]) {
                             Some(t) if t >= ws && t < we => t,
                             _ => break 'v,
-                        };
-                        let purchase = match f[4] {
-                            b"view" | b"cart" => false,
-                            b"purchase" => true,
-                            _ => break 'v,
+                        } };
+                        let purchase = match csv::event_type(f[4], room(f[4])) {
+                            Some(p) => p,
+                            None => break 'v,
                         };
                         if f[5].is_empty() {
                             break 'v;
                         }
-                        let price = if purchase {
+                        let (price, cat) = if purchase {
                             match csv::price_fast(f[6], room(f[6])) {
-                                Some(p) => p,
+                                Some(p) => (p, if abl & 16 != 0 { f[5].len() as u16 } else { match products.get_fast(f[5], room(f[5])) {
+                                    Some(i) => pcat[i as usize],
+                                    None => 99,
+                                } }),
                                 None => break 'v,
                             }
                         } else {
-                            0
+                            (0, 0)
                         };
                         let ingest_ms = (ing as i64 - 62_167_219_200) * 1000;
-                        if ing == M40 || (ingest_ms as i128) - (t as i128) > 86_400_000 {
+                        if abl & 2 == 0 && (ing == M40 || (ingest_ms as i128) - (t as i128) > 86_400_000) {
                             break 'v;
                         }
-                        let uh = table::uhash(uid);
-                        let cat = match products.get_fast(f[5], room(f[5])) {
-                            Some(i) => pcat[i as usize],
-                            None => 99,
-                        };
+                        let uh = if abl & 8 != 0 { uid.len() as u64 } else { table::uhash(uid) };
                         let gofs = (uid.as_ptr() as usize - basep as usize) as u64;
                         pend.push((uh, kr, [0, gofs | (price as u64) << 40, ((t - base) as u64) | (cat as u64) << 32]));
                         return;
@@ -320,5 +326,5 @@ pub fn scan7_probe(data: &[u8], buf: &mut Vec<u64>) -> u64 {
 #[inline(never)]
 #[no_mangle]
 pub fn f1_probe(s: &[u8]) -> i64 {
-    ts::parse_f1(s).unwrap_or(7)
+    ts::parse(s).unwrap_or(7)
 }

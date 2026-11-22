@@ -1,5 +1,6 @@
-//! A minimal Parquet writer: one row group, one PLAIN uncompressed v1 data
-//! page per column, thrift-compact metadata. Enough for the two output tables.
+//! A minimal Parquet writer: one row group, one uncompressed v1 data page per
+//! column (PLAIN, or RLE_DICTIONARY after a PLAIN dictionary page),
+//! thrift-compact metadata. Enough for the two output tables.
 
 use std::io::Write;
 
@@ -8,22 +9,61 @@ pub enum Kind {
     Str,
     /// INT32 annotated as DATE.
     Date,
+    Int32,
     Int64,
+}
+
+impl Kind {
+    fn physical(&self) -> i32 {
+        match self {
+            Kind::Str => 6,                 // BYTE_ARRAY
+            Kind::Date | Kind::Int32 => 1, // INT32
+            Kind::Int64 => 2,              // INT64
+        }
+    }
 }
 
 pub struct Column {
     pub name: &'static str,
     pub kind: Kind,
     pub optional: bool,
-    /// PLAIN-encoded values (present values only).
+    /// PLAIN-encoded values (present values only); for a dictionary column,
+    /// the dictionary entries.
     pub data: Vec<u8>,
     /// For optional columns: one definition level (0/1) per row.
     pub defined: Vec<bool>,
+    /// For a dictionary column: number of entries in `data`, and one entry
+    /// index per present value.
+    pub dict: Option<usize>,
+    pub idx: Vec<u32>,
 }
 
 impl Column {
     pub fn new(name: &'static str, kind: Kind, optional: bool) -> Self {
-        Column { name, kind, optional, data: Vec::new(), defined: Vec::new() }
+        Column { name, kind, optional, data: Vec::new(), defined: Vec::new(), dict: None, idx: Vec::new() }
+    }
+    /// A dictionary-encoded column: add entries with `entry_*`, then values
+    /// with `put_idx` (an entry's position) or `put_null`.
+    pub fn dictionary(name: &'static str, kind: Kind, optional: bool) -> Self {
+        Column { dict: Some(0), ..Column::new(name, kind, optional) }
+    }
+    #[inline]
+    pub fn entry_str(&mut self, s: &[u8]) {
+        self.data.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        self.data.extend_from_slice(s);
+        *self.dict.as_mut().unwrap() += 1;
+    }
+    #[inline]
+    pub fn entry_i32(&mut self, v: i32) {
+        self.data.extend_from_slice(&v.to_le_bytes());
+        *self.dict.as_mut().unwrap() += 1;
+    }
+    #[inline]
+    pub fn put_idx(&mut self, i: u32) {
+        self.idx.push(i);
+        if self.optional {
+            self.defined.push(true);
+        }
     }
     #[inline]
     pub fn put_str(&mut self, s: &[u8]) {
@@ -143,21 +183,68 @@ fn def_levels(defined: &[bool]) -> Vec<u8> {
     out
 }
 
+/// Dictionary indices: bit width byte, then one bit-packed RLE-hybrid run.
+fn dict_indices(idx: &[u32], ndict: usize) -> Vec<u8> {
+    let w = (usize::BITS - ndict.saturating_sub(1).leading_zeros()).max(1) as usize;
+    let groups = idx.len().div_ceil(8);
+    let mut out = Vec::with_capacity(groups * w + 12);
+    out.push(w as u8);
+    let mut h = ((groups as u64) << 1) | 1;
+    while h >= 0x80 {
+        out.push((h as u8) | 0x80);
+        h >>= 7;
+    }
+    out.push(h as u8);
+    let (mut acc, mut nb) = (0u64, 0usize);
+    for &v in idx.iter().chain(std::iter::repeat(&0).take(groups * 8 - idx.len())) {
+        debug_assert!((v as usize) < ndict.max(1));
+        acc |= (v as u64) << nb;
+        nb += w;
+        while nb >= 8 {
+            out.push(acc as u8);
+            acc >>= 8;
+            nb -= 8;
+        }
+    }
+    debug_assert_eq!(nb, 0);
+    out
+}
+
 pub fn write(path: &std::path::Path, table: &str, cols: &[Column], rows: usize) -> std::io::Result<()> {
     let mut file = Vec::<u8>::with_capacity(cols.iter().map(|c| c.data.len() + c.defined.len() / 8 + 64).sum::<usize>() + 4096);
     file.extend_from_slice(b"PAR1");
-    // (data_page_offset, total size) per column
+    // (chunk start, total size, dictionary page offset, data page offset) per column
     let mut chunks = Vec::new();
     for c in cols.iter().filter(|_| rows > 0) {
+        let start = file.len();
+        let mut dict_off = None;
+        let body = if let Some(ndict) = c.dict {
+            let mut h = T::new();
+            h.i32(1, 2); // DICTIONARY_PAGE
+            h.i32(2, c.data.len() as i32);
+            h.i32(3, c.data.len() as i32);
+            h.begin(7);
+            h.i32(1, ndict as i32);
+            h.i32(2, 0); // PLAIN
+            h.end();
+            h.out.push(0); // end PageHeader
+            dict_off = Some(file.len());
+            file.extend_from_slice(&h.out);
+            file.extend_from_slice(&c.data);
+            dict_indices(&c.idx, ndict)
+        } else {
+            Vec::new()
+        };
         let levels = if c.optional { def_levels(&c.defined) } else { Vec::new() };
-        let page_len = levels.len() + c.data.len();
+        let values: &[u8] = if c.dict.is_some() { &body } else { &c.data };
+        let page_len = levels.len() + values.len();
         let mut h = T::new();
         h.i32(1, 0); // DATA_PAGE
         h.i32(2, page_len as i32);
         h.i32(3, page_len as i32);
         h.begin(5);
         h.i32(1, rows as i32); // num_values (including nulls)
-        h.i32(2, 0); // PLAIN
+        h.i32(2, if c.dict.is_some() { 8 } else { 0 }); // RLE_DICTIONARY or PLAIN
         h.i32(3, 3); // RLE definition levels
         h.i32(4, 3); // RLE repetition levels
         h.end();
@@ -165,8 +252,8 @@ pub fn write(path: &std::path::Path, table: &str, cols: &[Column], rows: usize) 
         let offset = file.len();
         file.extend_from_slice(&h.out);
         file.extend_from_slice(&levels);
-        file.extend_from_slice(&c.data);
-        chunks.push((offset, file.len() - offset));
+        file.extend_from_slice(values);
+        chunks.push((start, file.len() - start, dict_off, offset));
     }
     // FileMetaData
     let mut m = T::new();
@@ -178,12 +265,12 @@ pub fn write(path: &std::path::Path, table: &str, cols: &[Column], rows: usize) 
     m.end();
     for c in cols {
         m.begin_elem();
-        let (ty, conv) = match c.kind {
-            Kind::Str => (6, Some(0)),  // BYTE_ARRAY, UTF8
-            Kind::Date => (1, Some(6)), // INT32, DATE
-            Kind::Int64 => (2, None),   // INT64
+        let conv = match c.kind {
+            Kind::Str => Some(0),  // UTF8
+            Kind::Date => Some(6), // DATE
+            Kind::Int32 | Kind::Int64 => None,
         };
-        m.i32(1, ty);
+        m.i32(1, c.kind.physical());
         m.i32(3, if c.optional { 1 } else { 0 });
         m.bin(4, c.name.as_bytes());
         if let Some(cv) = conv {
@@ -200,28 +287,27 @@ pub fn write(path: &std::path::Path, table: &str, cols: &[Column], rows: usize) 
         file.extend_from_slice(&m.out);
         file.extend_from_slice(&(m.out.len() as u32).to_le_bytes());
         file.extend_from_slice(b"PAR1");
-        return std::fs::File::create(path)?.write_all(&file);
+        return save(path, &file);
     }
     m.list(4, STRUCT, 1);
     m.begin_elem();
     m.list(1, STRUCT, cols.len());
-    for (c, &(off, size)) in cols.iter().zip(&chunks) {
+    for (c, &(start, size, dict_off, off)) in cols.iter().zip(&chunks) {
         m.begin_elem(); // ColumnChunk
-        m.i64(2, off as i64);
+        m.i64(2, start as i64);
         m.begin(3); // ColumnMetaData
-        let ty = match c.kind {
-            Kind::Str => 6,
-            Kind::Date => 1,
-            Kind::Int64 => 2,
-        };
-        m.i32(1, ty);
-        if c.optional {
-            m.list(2, I32, 2);
-            m.zigzag(0);
-            m.zigzag(3);
-        } else {
-            m.list(2, I32, 1);
-            m.zigzag(0);
+        m.i32(1, c.kind.physical());
+        // encodings: PLAIN, RLE (levels), RLE_DICTIONARY if a dictionary column
+        let mut enc = vec![0];
+        if c.optional || c.dict.is_some() {
+            enc.push(3);
+        }
+        if c.dict.is_some() {
+            enc.push(8);
+        }
+        m.list(2, I32, enc.len());
+        for e in enc {
+            m.zigzag(e);
         }
         m.list(3, BINARY, 1);
         m.varint(c.name.len() as u64);
@@ -231,6 +317,9 @@ pub fn write(path: &std::path::Path, table: &str, cols: &[Column], rows: usize) 
         m.i64(6, size as i64);
         m.i64(7, size as i64);
         m.i64(9, off as i64);
+        if let Some(d) = dict_off {
+            m.i64(11, d as i64);
+        }
         m.end();
         m.end();
     }
@@ -242,5 +331,15 @@ pub fn write(path: &std::path::Path, table: &str, cols: &[Column], rows: usize) 
     file.extend_from_slice(&m.out);
     file.extend_from_slice(&(m.out.len() as u32).to_le_bytes());
     file.extend_from_slice(b"PAR1");
-    std::fs::File::create(path)?.write_all(&file)
+    save(path, &file)
+}
+
+/// Writes the file and starts its writeback at once: dirty output pages left
+/// for the end can cost the container time after the process exits.
+fn save(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(bytes)?;
+    use std::os::fd::AsRawFd;
+    unsafe { libc::sync_file_range(f.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE) };
+    Ok(())
 }
