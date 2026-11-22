@@ -39,6 +39,7 @@ fn days_in_month(y: i64, m: i64) -> i64 {
 }
 
 /// The straightforward parser; `parse` must agree with it on every input.
+#[allow(dead_code)]
 #[inline]
 pub fn parse_slow(s: &[u8]) -> Option<i64> {
     let n = s.len();

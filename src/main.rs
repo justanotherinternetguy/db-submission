@@ -718,13 +718,14 @@ fn main() {
                     if f[5].is_empty() {
                         break 'v;
                     }
-                    let price = if purchase {
+                    // The category only matters for purchases (revenue, top_category).
+                    let (price, cat) = if purchase {
                         match csv::price_fast(f[6], room(f[6])) {
-                            Some(p) => p,
+                            Some(p) => (p, ctx.category(f[5], room(f[5]))),
                             None => break 'v,
                         }
                     } else {
-                        0
+                        (0, 0)
                     };
                     let ingest_ms = (kr.ingest() as i64 - 62_167_219_200) * 1000;
                     if kr.ingest() == M40 || (ingest_ms as i128) - (t as i128) > LATE as i128 {
@@ -733,7 +734,7 @@ fn main() {
                     let uh = uhash(uid);
                     ctx.links.prefetch(uh);
                     let gofs = (uid.as_ptr() as usize).wrapping_add(gb) as u64;
-                    let pr = P { pkey: 0, gp: gofs | (price as u64) << 40, ts: (t - ctx.base) as u32, cat: ctx.category(f[5], room(f[5])), dead: 0 };
+                    let pr = P { pkey: 0, gp: gofs | (price as u64) << 40, ts: (t - ctx.base) as u32, cat, dead: 0 };
                     pend.push((uh, kr, pr));
                     if pend.len() >= BATCH {
                         flush(ctx, pool, pb, pend, k, ev);

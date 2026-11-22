@@ -284,23 +284,22 @@ fn main() {
                         if f[5].is_empty() {
                             break 'v;
                         }
-                        let price = if purchase {
+                        let (price, cat) = if purchase {
                             match csv::price_fast(f[6], room(f[6])) {
-                                Some(p) => p,
+                                Some(p) => (p, if abl & 16 != 0 { f[5].len() as u16 } else { match products.get_fast(f[5], room(f[5])) {
+                                    Some(i) => pcat[i as usize],
+                                    None => 99,
+                                } }),
                                 None => break 'v,
                             }
                         } else {
-                            0
+                            (0, 0)
                         };
                         let ingest_ms = (ing as i64 - 62_167_219_200) * 1000;
                         if abl & 2 == 0 && (ing == M40 || (ingest_ms as i128) - (t as i128) > 86_400_000) {
                             break 'v;
                         }
                         let uh = if abl & 8 != 0 { uid.len() as u64 } else { table::uhash(uid) };
-                        let cat = if abl & 16 != 0 { f[5].len() as u16 } else { match products.get_fast(f[5], room(f[5])) {
-                            Some(i) => pcat[i as usize],
-                            None => 99,
-                        } };
                         let gofs = (uid.as_ptr() as usize - basep as usize) as u64;
                         pend.push((uh, kr, [0, gofs | (price as u64) << 40, ((t - base) as u64) | (cat as u64) << 32]));
                         return;
