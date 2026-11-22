@@ -622,11 +622,14 @@ fn main() {
     drop((parent, idptr));
     lap(&format!("links: {nlinks} lines, {nid} ids, {npeople} people"));
 
-    // Partition counts: about 8k event copies per event_id partition.
+    // Partition counts: about 8k event copies per event_id partition, capped.
     let est_events = bytes[1] / 70 + 1024;
     let est_clicks = bytes[2] / 45 + 1024;
-    let pb: u32 = (usize::BITS - 1 - (est_events / 8000).max(16).leading_zeros()).min(14);
-    let qb: u32 = pb - 1;
+    // At most 2^10 + 2^9 write streams per thread: their staging buffers
+    // (192 B each) must stay well inside a hyperthread's share of L2. Pass 2's
+    // filter and pass 3's counting sorts cope with the larger partitions.
+    let pb: u32 = (usize::BITS - 1 - (est_events / 8000).max(16).leading_zeros()).min(10);
+    let qb: u32 = (pb - 1).min(9);
     let (np, nq) = (1usize << pb, 1usize << qb);
     let ctx = Ctx {
         ws,
@@ -791,16 +794,48 @@ fn main() {
     // ---- pass 2: dedup events. Per event_id: the copy with the smallest
     // ingest wins (equal ingest: identical copies, keep one); every other
     // copy's P record is marked dead. An invalid winner kills all its copies.
-    par_run((0..nthreads).map(|_| Vec::<K>::new()).collect(), np, |table, p| {
+    // A 2-bit saturating counter per hash bucket first finds the keys that
+    // may repeat; only their copies go through the exact table.
+    par_run((0..nthreads).map(|_| (Vec::<u64>::new(), Vec::<K>::new())).collect(), np, |(filter, table), p| {
         let n: usize = s1.iter().map(|s| s.k.len(p)).sum();
-        let size = (n + n / 2).next_power_of_two().max(16);
+        if n == 0 {
+            return;
+        }
+        let fbits = (n * 8).next_power_of_two().max(64);
+        let fmask = fbits - 1;
+        filter.clear();
+        filter.resize(fbits / 32, 0);
+        let slot = |r: &K| {
+            let i = (r.w0 as usize) & fmask;
+            (i >> 5, (i & 31) * 2)
+        };
+        let mut suspects = 0usize;
+        for s in &s1 {
+            for b in s.k.blocks(p) {
+                for r in b {
+                    let (w, sh) = slot(r);
+                    let f = unsafe { filter.get_unchecked_mut(w) };
+                    let v = (*f >> sh) & 3;
+                    suspects += [0, 2, 1, 1][v as usize];
+                    *f += ((v < 2) as u64) << sh;
+                }
+            }
+        }
+        if suspects == 0 {
+            return;
+        }
+        let size = (suspects * 2).next_power_of_two().max(16);
         let mask = size - 1;
         table.clear();
         table.resize(size, K::default());
         for s in &s1 {
             for b in s.k.blocks(p) {
                 for r in b {
-                    let mut i = (r.w0 as usize) & mask;
+                    let (w, sh) = slot(r);
+                    if (unsafe { *filter.get_unchecked(w) } >> sh) & 3 != 2 {
+                        continue;
+                    }
+                    let mut i = ((r.w0 >> 32) as usize) & mask;
                     loop {
                         let t = unsafe { table.get_unchecked_mut(i) };
                         if t.w0 == 0 {
