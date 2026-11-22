@@ -826,160 +826,68 @@ fn main() {
     lap("pass 2: dedup");
 
     // ---- pass 3: sessions
+    // A person's events are grouped into GAP-wide bins of ts. A session never
+    // breaks inside a bin, and between two consecutive non-empty bins it breaks
+    // iff min(later) - max(earlier) > GAP, so ordering each person's events by
+    // bin (two counting sorts per partition) replaces sorting them by ts.
+    let nbins = (we - ws) as usize / GAP as usize + 1;
+    let use_bins = nbins <= 1 << 16;
     struct S3 {
         users: Vec<URow>,
         camp: Vec<[u64; 4]>, // (sessions, purchasing, revenue, assisted) per (campaign, day)
-        stamp: Vec<u32>,
-        serial: u32,
-        local: Vec<u64>,      // local person table keys (u64::MAX = empty)
-        local_id: Vec<u32>,   // local person table values
-        pid: Vec<u32>,        // per event: local person id
-        start: Vec<u32>,      // per person: offset into evs (n+1)
-        cstart: Vec<u32>,     // per person: offset into cls (n+1)
-        evs: Vec<P>,
+        cnt: Vec<u32>,       // per campaign: its clicks in the current window
+        since: Vec<u32>,     // per campaign: the session its current assist run began at
+        sday: Vec<u32>,      // per session of the current person: its day index
+        dfirst: Vec<u32>,    // per day index: the current person's first session on or after it
+        local: Vec<u64>,     // local person table keys (u64::MAX = empty)
+        local_id: Vec<u32>,  // local person table values
+        pkeys: Vec<u64>,     // per local person: its key
+        pname: Vec<u64>,     // per local person: its name
+        pstart: Vec<u32>,    // per local person: offset into the grouped events (n+1)
+        pos: Vec<u32>,
+        bstart: Vec<u32>,    // per bin: offset (n+1)
+        cpid: Vec<u32>,      // per click: local person
+        cstart: Vec<u32>,    // per local person: offset into cls (n+1)
+        r1: Vec<R>,
+        r2: Vec<R>,
         cls: Vec<C1>,
         cats: Vec<(u32, u64)>,
+    }
+    #[derive(Clone, Copy, Default)]
+    #[repr(C)]
+    struct R {
+        ts: u32,
+        pid: u32,
+        price: u32,
+        cat: u32,
+    }
+    #[inline(always)]
+    fn bin(ts: u32) -> usize {
+        ((ts - WEEK as u32) / GAP) as usize
     }
     let s3: Vec<S3> = (0..nthreads)
         .map(|_| S3 {
             users: Vec::new(),
             camp: vec![[0u64; 4]; (ncamp + 1) * ndays],
-            stamp: vec![0u32; ncamp],
-            serial: 0,
+            cnt: vec![0; ncamp],
+            since: vec![0; ncamp],
+            sday: Vec::new(),
+            dfirst: vec![0; ndays + 1],
             local: Vec::new(),
             local_id: Vec::new(),
-            pid: Vec::new(),
-            start: Vec::new(),
+            pkeys: Vec::new(),
+            pname: Vec::new(),
+            pstart: Vec::new(),
+            pos: Vec::new(),
+            bstart: Vec::new(),
+            cpid: Vec::new(),
             cstart: Vec::new(),
-            evs: Vec::new(),
+            r1: Vec::new(),
+            r2: Vec::new(),
             cls: Vec::new(),
             cats: Vec::new(),
         })
         .collect();
-    let s3 = par_run(s3, nq, |st, q| {
-        let n: usize = s1_ev.iter().map(|s| s.len(q)).sum();
-        if n == 0 {
-            return;
-        }
-        // Local person ids.
-        let size = (n * 2).next_power_of_two().max(16);
-        let mask = size - 1;
-        st.local.clear();
-        st.local.resize(size, u64::MAX);
-        st.local_id.resize(size, 0);
-        st.pid.clear();
-        st.start.clear();
-        let mut npeople = 0u32;
-        each(&s1_ev, q, |e| {
-            if e.dead != 0 {
-                return;
-            }
-            {
-                let mut k = (mix64(e.pkey) as usize) & mask;
-                let id = loop {
-                    let key = st.local[k];
-                    if key == e.pkey {
-                        break st.local_id[k];
-                    }
-                    if key == u64::MAX {
-                        st.local[k] = e.pkey;
-                        st.local_id[k] = npeople;
-                        npeople += 1;
-                        st.start.push(0);
-                        break npeople - 1;
-                    }
-                    k = (k + 1) & mask;
-                };
-                st.pid.push(id);
-                st.start[id as usize] += 1;
-            }
-        });
-        // Counting sort events by person.
-        let mut acc = 0u32;
-        for c in st.start.iter_mut() {
-            let v = *c;
-            *c = acc;
-            acc += v;
-        }
-        st.start.push(acc);
-        st.evs.clear();
-        st.evs.resize(acc as usize, P::default());
-        {
-            let mut pos: Vec<u32> = st.start[..npeople as usize].to_vec();
-            let mut i = 0;
-            each(&s1_ev, q, |e| {
-                if e.dead == 0 {
-                    let id = st.pid[i] as usize;
-                    st.evs[pos[id] as usize] = *e;
-                    pos[id] += 1;
-                    i += 1;
-                }
-            });
-        }
-        // Clicks of these people, grouped the same way.
-        st.cstart.clear();
-        st.cstart.resize(npeople as usize + 1, 0);
-        st.pid.clear();
-        each(&s1_cl, q, |c| {
-            {
-                let mut k = (mix64(c.pkey) as usize) & mask;
-                let id = loop {
-                    let key = st.local[k];
-                    if key == c.pkey {
-                        break st.local_id[k];
-                    }
-                    if key == u64::MAX {
-                        break u32::MAX;
-                    }
-                    k = (k + 1) & mask;
-                };
-                st.pid.push(id);
-                if id != u32::MAX {
-                    st.cstart[id as usize] += 1;
-                }
-            }
-        });
-        let mut acc = 0u32;
-        for c in st.cstart.iter_mut() {
-            let v = *c;
-            *c = acc;
-            acc += v;
-        }
-        st.cls.clear();
-        st.cls.resize(acc as usize, C1::default());
-        {
-            let mut pos: Vec<u32> = st.cstart[..npeople as usize].to_vec();
-            let mut i = 0;
-            each(&s1_cl, q, |c| {
-                let id = st.pid[i];
-                i += 1;
-                if id != u32::MAX {
-                    st.cls[pos[id as usize] as usize] = *c;
-                    pos[id as usize] += 1;
-                }
-            });
-        }
-        let evs = std::mem::take(&mut st.evs);
-        let cls = std::mem::take(&mut st.cls);
-        let mut evs = evs;
-        let mut cls = cls;
-        for pidx in 0..npeople as usize {
-            let (a, b) = (st.start[pidx] as usize, st.start[pidx + 1] as usize);
-            let (ca, cb) = (st.cstart[pidx] as usize, st.cstart[pidx + 1] as usize);
-            let pe = &mut evs[a..b];
-            if pe.len() > 1 {
-                pe.sort_unstable_by_key(|e| e.ts);
-            }
-            let pc = &mut cls[ca..cb];
-            if pc.len() > 1 {
-                pc.sort_unstable_by_key(|c| c.ts);
-            }
-            person(st, &ctx, &store, &evs[a..b], &cls[ca..cb], ncamp);
-        }
-        st.evs = evs;
-        st.cls = cls;
-    });
-
     fn each<T: Copy + Default>(v: &[Scatter<T>], q: usize, mut f: impl FnMut(&T)) {
         for s in v {
             for b in s.blocks(q) {
@@ -989,24 +897,195 @@ fn main() {
             }
         }
     }
+    /// Exclusive prefix sums in place; returns the total.
+    fn prefix(v: &mut [u32]) -> u32 {
+        let mut acc = 0u32;
+        for c in v.iter_mut() {
+            let x = *c;
+            *c = acc;
+            acc += x;
+        }
+        acc
+    }
+    #[inline(always)]
+    fn local_find(st: &S3, pkey: u64) -> u32 {
+        let mask = st.local.len() - 1;
+        let mut k = (mix64(pkey) as usize) & mask;
+        loop {
+            let key = unsafe { *st.local.get_unchecked(k) };
+            if key == pkey {
+                return unsafe { *st.local_id.get_unchecked(k) };
+            }
+            if key == u64::MAX {
+                return u32::MAX;
+            }
+            k = (k + 1) & mask;
+        }
+    }
+    fn insert_slot(st: &mut S3, pkey: u64, id: u32) {
+        let mask = st.local.len() - 1;
+        let mut k = (mix64(pkey) as usize) & mask;
+        while st.local[k] != u64::MAX {
+            k = (k + 1) & mask;
+        }
+        st.local[k] = pkey;
+        st.local_id[k] = id;
+    }
+    let s3 = par_run(s3, nq, |st, q| {
+        let n: usize = s1_ev.iter().map(|s| s.len(q)).sum();
+        if n == 0 {
+            return;
+        }
+        // Local person ids, in a table that grows with the people seen.
+        let size = (n / 8).next_power_of_two().max(1024);
+        st.local.clear();
+        st.local.resize(size, u64::MAX);
+        st.local_id.resize(size, 0);
+        st.pkeys.clear();
+        st.pname.clear();
+        st.pstart.clear();
+        st.r1.clear();
+        if use_bins {
+            st.bstart.clear();
+            st.bstart.resize(nbins + 1, 0);
+        }
+        each(&s1_ev, q, |e| {
+            if e.dead != 0 {
+                return;
+            }
+            let mut id = local_find(st, e.pkey);
+            if id == u32::MAX {
+                id = st.pkeys.len() as u32;
+                st.pkeys.push(e.pkey);
+                st.pname.push(if e.pkey & LINKED != 0 {
+                    ctx.comp_name[(e.pkey & !LINKED) as usize].load(Relaxed)
+                } else {
+                    Store::field_name(e.gp & M40)
+                });
+                st.pstart.push(0);
+                if st.pkeys.len() * 2 > st.local.len() {
+                    let size = st.local.len() * 2;
+                    st.local.clear();
+                    st.local.resize(size, u64::MAX);
+                    st.local_id.resize(size, 0);
+                    for i in 0..st.pkeys.len() {
+                        insert_slot(st, st.pkeys[i], i as u32);
+                    }
+                } else {
+                    insert_slot(st, e.pkey, id);
+                }
+            }
+            unsafe { *st.pstart.get_unchecked_mut(id as usize) += 1 };
+            if use_bins {
+                unsafe { *st.bstart.get_unchecked_mut(bin(e.ts)) += 1 };
+            }
+            st.r1.push(R { ts: e.ts, pid: id, price: e.price(), cat: e.cat as u32 });
+        });
+        let npeople = st.pkeys.len();
+        let m = st.r1.len();
+        let mut r1 = std::mem::take(&mut st.r1);
+        let mut r2 = std::mem::take(&mut st.r2);
+        r2.clear();
+        r2.resize(m, R::default());
+        if use_bins {
+            // By bin, then stably by person.
+            prefix(&mut st.bstart);
+            for r in &r1 {
+                let b = unsafe { st.bstart.get_unchecked_mut(bin(r.ts)) };
+                unsafe { *r2.get_unchecked_mut(*b as usize) = *r };
+                *b += 1;
+            }
+            std::mem::swap(&mut r1, &mut r2);
+        }
+        let total = prefix(&mut st.pstart);
+        st.pstart.push(total);
+        st.pos.clear();
+        st.pos.extend_from_slice(&st.pstart[..npeople]);
+        for r in &r1 {
+            let p = unsafe { st.pos.get_unchecked_mut(r.pid as usize) };
+            unsafe { *r2.get_unchecked_mut(*p as usize) = *r };
+            *p += 1;
+        }
+        let evs = r2;
+        st.r2 = r1;
+        // Clicks of these people, grouped the same way.
+        st.cstart.clear();
+        st.cstart.resize(npeople + 1, 0);
+        st.cpid.clear();
+        each(&s1_cl, q, |c| {
+            let id = local_find(st, c.pkey);
+            st.cpid.push(id);
+            if id != u32::MAX {
+                st.cstart[id as usize] += 1;
+            }
+        });
+        let total = prefix(&mut st.cstart);
+        let mut cls = std::mem::take(&mut st.cls);
+        cls.clear();
+        cls.resize(total as usize, C1::default());
+        st.pos.clear();
+        st.pos.extend_from_slice(&st.cstart[..npeople]);
+        let mut i = 0;
+        each(&s1_cl, q, |c| {
+            let id = st.cpid[i];
+            i += 1;
+            if id != u32::MAX {
+                cls[st.pos[id as usize] as usize] = *c;
+                st.pos[id as usize] += 1;
+            }
+        });
+        for p in 0..npeople {
+            let (a, b) = (st.pstart[p] as usize, st.pstart[p + 1] as usize);
+            let (ca, cb) = (st.cstart[p] as usize, st.cstart[p + 1] as usize);
+            let pc = &mut cls[ca..cb];
+            if pc.len() > 1 {
+                pc.sort_unstable_by_key(|c| c.ts);
+            }
+            let pe = &evs[a..b];
+            if !use_bins {
+                let mut v = pe.to_vec();
+                v.sort_unstable_by_key(|e| e.ts);
+                person(st, &ctx, &store, st.pname[p], &v, &cls[ca..cb], ncamp);
+            } else {
+                person(st, &ctx, &store, st.pname[p], pe, &cls[ca..cb], ncamp);
+            }
+        }
+        st.r1 = evs;
+        st.cls = cls;
+    });
 
-    fn person(st: &mut S3, ctx: &Ctx, store: &Store, evs: &[P], cls: &[C1], ncamp: usize) {
-        let name = if evs[0].pkey & LINKED != 0 {
-            ctx.comp_name[(evs[0].pkey & !LINKED) as usize].load(Relaxed)
-        } else {
-            Store::field_name(evs[0].gp & M40)
-        };
+    /// Sessions `a..b` of the current person (whose latest session is on day
+    /// `cur`) were assisted by campaign `c`.
+    #[inline]
+    fn assist(st: &mut S3, ndays: usize, cur: u32, c: usize, a: u32, b: u32) {
+        if a >= b {
+            return;
+        }
+        let (d0, d1) = (st.sday[a as usize], st.sday[b as usize - 1]);
+        if d0 == d1 {
+            st.camp[c * ndays + d0 as usize][3] += (b - a) as u64;
+            return;
+        }
+        for d in d0..=d1 {
+            let lo = a.max(st.dfirst[d as usize]);
+            let hi = if d < cur { b.min(st.dfirst[d as usize + 1]) } else { b };
+            if hi > lo {
+                st.camp[c * ndays + d as usize][3] += (hi - lo) as u64;
+            }
+        }
+    }
+
+    /// One person: `evs` ordered by bin, `cls` sorted by ts.
+    fn person(st: &mut S3, ctx: &Ctx, store: &Store, name: u64, evs: &[R], cls: &[C1], ncamp: usize) {
         let ndays = ctx.ndays;
-        let mut lo = 0usize;
-        let mut hi = 0usize;
-        let mut i = 0usize;
-        // current user-day accumulation
-        let mut cur_day: i64 = i64::MIN;
-        let mut d_sessions = 0u32;
-        let mut d_events = 0u32;
-        let mut d_revenue = 0u64;
+        let n = evs.len();
+        st.sday.clear();
         st.cats.clear();
-        let flush = |st: &mut S3, day: i64, s: u32, e: u32, r: u64| {
+        let (mut lo, mut hi) = (0usize, 0usize);
+        // The current user-day.
+        let mut cur_day = u32::MAX;
+        let (mut d_sessions, mut d_events, mut d_revenue) = (0u32, 0u32, 0u64);
+        let flush = |st: &mut S3, day: u32, s: u32, e: u32, r: u64| {
             let mut top = u32::MAX;
             let mut best = 0u64;
             for &(c, v) in &st.cats {
@@ -1015,48 +1094,36 @@ fn main() {
                     top = c;
                 }
             }
-            st.users.push(URow { name, day: day as i32, sessions: s, events: e, revenue: r, top });
+            st.users.push(URow { name, day: (ctx.day0 + day as i64) as i32, sessions: s, events: e, revenue: r, top });
             st.cats.clear();
         };
-        while i < evs.len() {
-            let start = evs[i].ts;
-            let mut prev = start;
-            let mut j = i;
-            let mut revenue = 0u64;
-            let mut purchase = false;
-            let day = (ctx.base + start as i64).div_euclid(DAY);
-            if day != cur_day {
-                if cur_day != i64::MIN {
-                    flush(st, cur_day, d_sessions, d_events, d_revenue);
-                }
-                cur_day = day;
-                d_sessions = 0;
-                d_events = 0;
-                d_revenue = 0;
+        // Ends a session: credit and assists.
+        let mut end = |st: &mut S3, start: u32, di: u32, revenue: u64, purchase: bool| {
+            let g = st.sday.len() as u32;
+            st.sday.push(di);
+            if cls.is_empty() {
+                let a = &mut st.camp[ncamp * ndays + di as usize];
+                a[0] += 1;
+                a[1] += purchase as u64;
+                a[2] += revenue;
+                return;
             }
-            while j < evs.len() && evs[j].ts - prev <= GAP {
-                let e = &evs[j];
-                prev = e.ts;
-                let price = e.price();
-                if price > 0 {
-                    purchase = true;
-                    revenue += price as u64;
-                    match st.cats.iter_mut().find(|(c, _)| *c == e.cat as u32) {
-                        Some(x) => x.1 += price as u64,
-                        None => st.cats.push((e.cat as u32, price as u64)),
-                    }
-                }
-                j += 1;
-            }
-            d_sessions += 1;
-            d_events += (j - i) as u32;
-            d_revenue += revenue;
-            let di = (day - ctx.day0) as usize;
-            // attribution: clicks with start - 7d <= ts <= start
+            // Window: clicks with start - 7d <= ts <= start.
             while hi < cls.len() && cls[hi].ts <= start {
+                let c = cls[hi].camp as usize;
+                if st.cnt[c] == 0 {
+                    st.since[c] = g;
+                }
+                st.cnt[c] += 1;
                 hi += 1;
             }
             while lo < hi && (cls[lo].ts as i64) < start as i64 - WEEK {
+                let c = cls[lo].camp as usize;
+                st.cnt[c] -= 1;
+                if st.cnt[c] == 0 {
+                    let s = st.since[c];
+                    assist(st, ndays, di, c, s, g);
+                }
                 lo += 1;
             }
             let credited = if lo < hi {
@@ -1069,30 +1136,79 @@ fn main() {
                         best = k;
                     }
                 }
-                st.serial = st.serial.wrapping_add(1);
-                if st.serial == 0 {
-                    st.stamp.iter_mut().for_each(|x| *x = 0);
-                    st.serial = 1;
-                }
-                let serial = st.serial;
-                for c in &cls[lo..hi] {
-                    let ci = c.camp as usize;
-                    if st.stamp[ci] != serial {
-                        st.stamp[ci] = serial;
-                        st.camp[ci * ndays + di][3] += 1;
-                    }
-                }
                 cls[best].camp as usize
             } else {
                 ncamp
             };
-            let a = &mut st.camp[credited * ndays + di];
+            let a = &mut st.camp[credited * ndays + di as usize];
             a[0] += 1;
             a[1] += purchase as u64;
             a[2] += revenue;
+        };
+        let mut i = 0usize;
+        let mut prev_mx = 0u32;
+        let (mut s_start, mut s_day, mut s_rev, mut s_purchase) = (0u32, 0u32, 0u64, false);
+        while i < n {
+            // One bin.
+            let b = bin(evs[i].ts);
+            let (mut mn, mut mx) = (evs[i].ts, evs[i].ts);
+            let mut j = i + 1;
+            while j < n && bin(evs[j].ts) == b {
+                mn = mn.min(evs[j].ts);
+                mx = mx.max(evs[j].ts);
+                j += 1;
+            }
+            if i == 0 || mn - prev_mx > GAP {
+                if i != 0 {
+                    end(st, s_start, s_day, s_rev, s_purchase);
+                }
+                s_start = mn;
+                s_day = ((ctx.base + mn as i64).div_euclid(DAY) - ctx.day0) as u32;
+                s_rev = 0;
+                s_purchase = false;
+                if s_day != cur_day {
+                    if cur_day != u32::MAX {
+                        flush(st, cur_day, d_sessions, d_events, d_revenue);
+                    }
+                    let from = if cur_day == u32::MAX { s_day } else { cur_day + 1 };
+                    let g = st.sday.len() as u32;
+                    for d in from..=s_day {
+                        st.dfirst[d as usize] = g;
+                    }
+                    cur_day = s_day;
+                    d_sessions = 0;
+                    d_events = 0;
+                    d_revenue = 0;
+                }
+                d_sessions += 1;
+            }
+            d_events += (j - i) as u32;
+            for e in &evs[i..j] {
+                if e.price > 0 {
+                    s_purchase = true;
+                    s_rev += e.price as u64;
+                    d_revenue += e.price as u64;
+                    match st.cats.iter_mut().find(|(c, _)| *c == e.cat) {
+                        Some(x) => x.1 += e.price as u64,
+                        None => st.cats.push((e.cat, e.price as u64)),
+                    }
+                }
+            }
+            prev_mx = mx;
             i = j;
         }
+        end(st, s_start, s_day, s_rev, s_purchase);
         flush(st, cur_day, d_sessions, d_events, d_revenue);
+        // Close the assist runs still open.
+        let g = st.sday.len() as u32;
+        for k in lo..hi {
+            let c = cls[k].camp as usize;
+            if st.cnt[c] != 0 {
+                st.cnt[c] = 0;
+                let s = st.since[c];
+                assist(st, ndays, cur_day, c, s, g);
+            }
+        }
     }
     std::mem::forget((s1_ev, s1_cl, pool));
     lap("pass 3: sessions");
