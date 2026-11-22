@@ -9,6 +9,7 @@
 //!   3. per person partition: group, sort, sessionize, attribute, aggregate.
 //!   4. write Parquet.
 
+mod alloc;
 mod buf;
 mod csv;
 mod out;
@@ -39,6 +40,10 @@ const CHUNK: usize = 4 << 20;
 const PREFETCH: usize = 16;
 
 const LINKED: u64 = 1 << 63;
+
+/// Large heap blocks get transparent huge pages (see alloc.rs).
+#[global_allocator]
+static GLOBAL: alloc::HugeAlloc = alloc::HugeAlloc;
 
 // ---------------------------------------------------------------- hashing
 
