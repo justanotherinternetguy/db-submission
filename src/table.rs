@@ -28,6 +28,8 @@ pub fn uhash(b: &[u8]) -> u64 {
 /// otherwise a verified hash map.
 pub struct IdIndex {
     prefix: Vec<u8>,
+    /// `prefix` as a little-endian word (when shorter than 8 bytes)
+    pword: u64,
     flat: Option<Vec<u32>>,
     map: hashbrown::HashMap<u64, u32, crate::IdBuild>,
     keys: Vec<Vec<u8>>,
@@ -73,18 +75,34 @@ impl IdIndex {
                 map.insert(xxh3_64(k), i as u32);
             }
         }
-        IdIndex { prefix: prefix.to_vec(), flat, map, keys: keys.to_vec() }
+        let mut pw = [0u8; 8];
+        let pl = prefix.len().min(8);
+        pw[..pl].copy_from_slice(&prefix[..pl]);
+        IdIndex { prefix: prefix.to_vec(), pword: u64::from_le_bytes(pw), flat, map, keys: keys.to_vec() }
     }
 
     /// `get`, reading up to 8 bytes before the key's end when `room`.
     #[inline(always)]
     pub fn get_fast(&self, k: &[u8], room: bool) -> Option<u32> {
         if let Some(t) = &self.flat {
+            let len = k.len();
             let pl = self.prefix.len();
-            let dl = k.len().wrapping_sub(pl);
-            if room && (1..=8).contains(&dl) && k[..pl] == self.prefix[..] && (k[pl] != b'0' || dl == 1) {
-                let n = unsafe { crate::csv::digits_tail(k.as_ptr().add(k.len()), dl) }?;
-                return match t.get(n as usize) {
+            if room && len <= 8 && len > pl && pl < 8 {
+                // The key is the top `len` bytes of the 8 ending at its end.
+                let w = unsafe { (k.as_ptr().add(len).sub(8) as *const u64).read_unaligned() };
+                let key = w >> (8 * (8 - len));
+                let pmask = (1u64 << (8 * pl)) - 1;
+                let pword = self.pword;
+                let dl = len - pl;
+                let low = 8 * (8 - dl); // bits before the digits, replaced by '0'
+                let mask = (1u64 << low) - 1;
+                let d = (w & !mask) | (0x3030_3030_3030_3030 & mask);
+                let first = (w >> low) & 0xFF;
+                let ok = ((key & pmask) == pword) & crate::ts::digits8(d) & ((first != b'0' as u64) | (dl == 1));
+                if !ok {
+                    return None;
+                }
+                return match t.get(crate::ts::value8(d) as usize) {
                     Some(&v) if v != u32::MAX => Some(v),
                     _ => None,
                 };
@@ -200,5 +218,44 @@ impl AtomicMap {
     #[inline]
     pub fn set_val(&self, i: usize, v: u32) {
         self.slot(i).val.store(v, Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_fast_matches_get() {
+        for (prefix, n) in [(&b"p"[..], 50_000u32), (&b"c_"[..], 2000)] {
+            let mut keys: Vec<Vec<u8>> = (0..n).map(|i| [prefix, (i * 3 + 1).to_string().as_bytes()].concat()).collect();
+            keys.swap(0, 7);
+            let idx = IdIndex::build(&keys, prefix);
+            let oracle: std::collections::HashMap<Vec<u8>, u32> = keys.iter().enumerate().map(|(i, k)| (k.clone(), i as u32)).collect();
+            assert!(idx.flat.is_some());
+            let alphabet = b"pc_0123456789P\"x\r ";
+            let mut state = 0x1234_5678_9abc_def1u64;
+            let mut next = || {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (state >> 33) as usize
+            };
+            for round in 0..400_000 {
+                let mut c: Vec<u8> = if round % 2 == 0 {
+                    keys[next() % keys.len()].clone()
+                } else {
+                    (0..next() % 11).map(|_| alphabet[next() % alphabet.len()]).collect()
+                };
+                if round % 3 == 0 && !c.is_empty() {
+                    let i = next() % c.len();
+                    c[i] = alphabet[next() % alphabet.len()];
+                }
+                let mut buf = b"0123456789,9,\"x,".to_vec();
+                buf.extend_from_slice(&c);
+                buf.extend_from_slice(b",junk");
+                let f = &buf[16..16 + c.len()];
+                assert_eq!(idx.get_fast(f, true), idx.get(f), "{:?}", String::from_utf8_lossy(&c));
+                assert_eq!(idx.get(f), oracle.get(&c).copied());
+            }
+        }
     }
 }
