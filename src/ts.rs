@@ -152,19 +152,19 @@ fn date(s: &[u8]) -> Option<i64> {
     let k = load8(s, 2);
     let c = load2(s, 0);
     let i = (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize;
-    DATES.with(|m| {
-        let e = unsafe { (*m.get()).get_unchecked(i) };
-        if e.k == k && e.c == c | VALID {
-            Some(e.days as i64)
-        } else {
-            date_miss(s, i, m)
-        }
-    })
+    // A trivial closure, so `with` inlines to a thread-pointer offset.
+    let m: *mut [DateSlot; 256] = DATES.with(|m| m.get());
+    let e = unsafe { (*m).get_unchecked(i) };
+    if e.k == k && e.c == c | VALID {
+        Some(e.days as i64)
+    } else {
+        date_miss(s, i, m)
+    }
 }
 
 #[cold]
 #[inline(never)]
-fn date_miss(s: &[u8], i: usize, m: &std::cell::UnsafeCell<[DateSlot; 256]>) -> Option<i64> {
+fn date_miss(s: &[u8], i: usize, m: *mut [DateSlot; 256]) -> Option<i64> {
     if s[4] != b'-' || s[7] != b'-' {
         return None;
     }
@@ -175,7 +175,7 @@ fn date_miss(s: &[u8], i: usize, m: &std::cell::UnsafeCell<[DateSlot; 256]>) -> 
         return None;
     }
     let days = days_from_civil(y, mo, d);
-    unsafe { (*m.get())[i] = DateSlot { k: load8(s, 2), c: load2(s, 0) | VALID, days: days as i32 } };
+    unsafe { (*m)[i] = DateSlot { k: load8(s, 2), c: load2(s, 0) | VALID, days: days as i32 } };
     Some(days)
 }
 
