@@ -436,18 +436,19 @@ fn main() {
 
     // ---- links
     type LinkPair = (u64, u64, u64, u64); // (ha, pa, hb, pb)
-    let link_states: Vec<Vec<LinkPair>> = (0..nthreads).map(|_| Vec::new()).collect();
-    let link_states = par_run(link_states, link_chunks.len(), |st, t| {
+    let link_states: Vec<(Vec<LinkPair>, Vec<u64>)> = (0..nthreads).map(|_| (Vec::new(), Vec::new())).collect();
+    let link_states = par_run(link_states, link_chunks.len(), |(pairs, buf), t| {
         let (fi, s, e, _) = link_chunks[t];
         let m = &store.maps[fi];
         let basep = m.as_ptr();
-        csv::scan::<2>(&m[s..e], |f| {
+        csv::scan::<2>(&m[s..e], buf, |f| {
             if f[0].is_empty() || f[1].is_empty() {
                 return;
             }
-            st.push((uhash(f[0]), store.ptr(fi, basep, f[0]), uhash(f[1]), store.ptr(fi, basep, f[1])));
+            pairs.push((uhash(f[0]), store.ptr(fi, basep, f[0]), uhash(f[1]), store.ptr(fi, basep, f[1])));
         });
     });
+    let link_states: Vec<Vec<LinkPair>> = link_states.into_iter().map(|(p, _)| p).collect();
     let nlinks: usize = link_states.iter().map(|v| v.len()).sum();
     // Concurrent union-find over slot indices of a concurrent ID table.
     // parent[x] == 0 means x is a root; otherwise parent[x] - 1 is its parent.
@@ -566,10 +567,11 @@ fn main() {
         ev: Parts<E1>,
         cl: Parts<C1>,
         pending: Vec<(u64, C1)>,
+        buf: Vec<u64>,
     }
     let s1: Vec<S1> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..nthreads)
-            .map(|_| sc.spawn(|| S1 { ev: Parts::new(np, ev_cap), cl: Parts::new(nq, cl_cap), pending: Vec::new() }))
+            .map(|_| sc.spawn(|| S1 { ev: Parts::new(np, ev_cap), cl: Parts::new(nq, cl_cap), pending: Vec::new(), buf: Vec::new() }))
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
@@ -579,7 +581,7 @@ fn main() {
         let basep = m.as_ptr();
         let ctx = &ctx;
         if kind == 1 {
-            csv::scan::<7>(&m[s..e], |f| {
+            csv::scan::<7>(&m[s..e], &mut st.buf, |f| {
                 let eid = f[0];
                 if eid.is_empty() {
                     return;
@@ -626,7 +628,7 @@ fn main() {
             });
         } else {
             st.pending.clear();
-            csv::scan::<4>(&m[s..e], |f| {
+            csv::scan::<4>(&m[s..e], &mut st.buf, |f| {
                 if f[0].is_empty() || f[1].is_empty() {
                     return;
                 }
