@@ -1,5 +1,5 @@
 /target
-/out
-/dev
-/dev-answer
-out20/
+/out*/
+/dev/
+/dev-answer/
+*.parquet
