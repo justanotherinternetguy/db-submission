@@ -223,10 +223,14 @@ impl K {
 /// orders every F1 value exactly; unparseable sorts last.
 #[inline(always)]
 fn ingest_secs(s: &[u8]) -> u64 {
-    match ts::parse_f1(s).or_else(|| ts::parse(s)) {
-        Some(ms) => (ms.div_euclid(1000) + 62_167_219_200).clamp(0, M40 as i64 - 1) as u64,
-        None => M40,
-    }
+    let secs = match ts::f1_secs(s) {
+        Some(secs) => secs,
+        None => match ts::parse(s) {
+            Some(ms) => ms.div_euclid(1000),
+            None => return M40,
+        },
+    };
+    (secs + 62_167_219_200).clamp(0, M40 as i64 - 1) as u64
 }
 
 /// A valid event copy, by person (pass 1 -> 3).

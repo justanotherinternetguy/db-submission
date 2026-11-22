@@ -247,10 +247,14 @@ fn main() {
         // records), minus the person lookup and scatter.
         const M40: u64 = (1 << 40) - 1;
         let ingest_secs = |s: &[u8]| -> u64 {
-            match ts::parse_f1(s).or_else(|| ts::parse(s)) {
-                Some(ms) => (ms.div_euclid(1000) + 62_167_219_200).clamp(0, M40 as i64 - 1) as u64,
-                None => M40,
-            }
+            let secs = match ts::f1_secs(s) {
+                Some(secs) => secs,
+                None => match ts::parse(s) {
+                    Some(ms) => ms.div_euclid(1000),
+                    None => return M40,
+                },
+            };
+            (secs + 62_167_219_200).clamp(0, M40 as i64 - 1) as u64
         };
         let abl: u32 = std::env::var("ABL").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
         let mut keys: Vec<[u64; 3]> = Vec::with_capacity(lines + 16);

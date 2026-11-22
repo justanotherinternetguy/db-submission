@@ -246,10 +246,16 @@ fn f3_slow(s: &[u8]) -> Option<i64> {
 /// F1 only (`YYYY-MM-DDTHH:MM:SSZ`), for `ingest_ts`; None for anything else.
 #[inline(always)]
 pub fn parse_f1(s: &[u8]) -> Option<i64> {
+    Some(f1_secs(s)? * 1000)
+}
+
+/// `parse_f1` in seconds.
+#[inline(always)]
+pub fn f1_secs(s: &[u8]) -> Option<i64> {
     if s.len() == 20 && s[10] == b'T' && s[19] == b'Z' {
         let tod = time_of_day(s)?;
         let d = date(s)?;
-        Some((d * 86_400 + tod) * 1000)
+        Some(d * 86_400 + tod)
     } else {
         None
     }
@@ -263,7 +269,9 @@ pub fn parse(s: &[u8]) -> Option<i64> {
             let a = load8(s, 0);
             let b = load8(s, 5);
             if digits8(a) & digits8(b) {
-                Some((value8(a) * 100_000 + value8(b) % 100_000) as i64)
+                // b holds digits 5..13; its first 3 are also in a.
+                let b = (b & !0xFF_FFFF) | 0x30_3030;
+                Some((value8(a) * 100_000 + value8(b)) as i64)
             } else {
                 None
             }
@@ -331,6 +339,7 @@ mod tests {
             assert_eq!(parse(&v), parse_slow(&v), "{:?}", String::from_utf8_lossy(&v));
             let f1 = if v.len() == 20 && v[19] == b'Z' { parse_slow(&v) } else { None };
             assert_eq!(super::parse_f1(&v), f1, "{:?}", String::from_utf8_lossy(&v));
+            assert_eq!(super::f1_secs(&v).map(|x| x * 1000), f1, "{:?}", String::from_utf8_lossy(&v));
         }
         // Every calendar day 1999..2031, and every offset.
         for days in days_from_civil(1999, 1, 1)..days_from_civil(2031, 1, 1) {
