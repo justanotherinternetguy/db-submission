@@ -145,8 +145,8 @@ impl Ctx {
         (mix64(pkey) >> self.qshift) as usize
     }
     #[inline]
-    fn category(&self, product: &[u8]) -> u16 {
-        match self.products.get(product) {
+    fn category(&self, product: &[u8], room: bool) -> u16 {
+        match self.products.get_fast(product, room) {
             Some(i) => self.product_cat[i as usize],
             None => self.unknown_cat,
         }
@@ -323,14 +323,16 @@ fn manifest_value(text: &str, key: &str) -> i64 {
     ts::parse(rest[..q2].as_bytes()).unwrap_or_else(|| panic!("manifest: bad {key}"))
 }
 
-fn minflt() -> u64 {
+/// (minor faults, user+sys CPU seconds) of this process.
+fn proc_stat() -> (u64, f64) {
     std::fs::read_to_string("/proc/self/stat")
         .ok()
         .and_then(|s| {
-            let after = &s[s.rfind(')')? + 2..];
-            after.split(' ').nth(7)?.parse().ok()
+            let f: Vec<&str> = s[s.rfind(')')? + 2..].split(' ').collect();
+            let ticks: f64 = f.get(11)?.parse::<f64>().ok()? + f.get(12)?.parse::<f64>().ok()?;
+            Some((f.get(7)?.parse().ok()?, ticks / 100.0))
         })
-        .unwrap_or(0)
+        .unwrap_or((0, 0.0))
 }
 
 /// Distinct keys in first-seen order, and for each line its key's position.
@@ -356,7 +358,10 @@ fn main() {
         .filter(|&n| n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()))
         .min(32);
-    let lap = |what: &str| eprintln!("[{:>7.3}s] {what}  (minflt {})", t0.elapsed().as_secs_f64(), minflt());
+    let lap = |what: &str| {
+        let (flt, cpu) = proc_stat();
+        eprintln!("[{:>7.3}s] {what}  (cpu {cpu:.2}s, minflt {flt})", t0.elapsed().as_secs_f64())
+    };
 
     // ---- manifest, products, campaigns
     let manifest = std::fs::read_to_string(data_dir.join("manifest.json")).expect("manifest.json");
@@ -589,6 +594,8 @@ fn main() {
         let m = &store.maps[fi];
         let basep = m.as_ptr();
         let ctx = &ctx;
+        // At least 8 readable bytes end at a field's end (the header precedes all data).
+        let room = |f: &[u8]| f.as_ptr() as usize + f.len() >= basep as usize + 8;
         let tk = Instant::now();
         let _timer = Timer(&mut st.cpu[kind as usize] as *mut f64, tk);
         if kind == 1 {
@@ -618,7 +625,7 @@ fn main() {
                         break 'v;
                     }
                     let price = if purchase {
-                        match csv::price(f[6]) {
+                        match csv::price_fast(f[6], room(f[6])) {
                             Some(p) => p,
                             None => break 'v,
                         }
@@ -631,7 +638,7 @@ fn main() {
                     r.ok = 1;
                     r.ts = (t - ctx.base) as u32;
                     r.price = price;
-                    r.cat = ctx.category(f[5]);
+                    r.cat = ctx.category(f[5], room(f[5]));
                     r.uhash = uhash(uid);
                     r.uptr = store.ptr(fi, basep, uid);
                 }
@@ -643,7 +650,7 @@ fn main() {
                 if f[0].is_empty() || f[1].is_empty() {
                     return;
                 }
-                let camp = match ctx.campaigns.get(f[2]) {
+                let camp = match ctx.campaigns.get_fast(f[2], room(f[2])) {
                     Some(c) => c,
                     None => return,
                 };

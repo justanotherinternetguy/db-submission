@@ -40,6 +40,36 @@ pub fn split<'a, const N: usize>(line: &'a [u8], out: &mut [&'a [u8]; N]) -> boo
     field == N
 }
 
+/// Value of the 1..=8 ASCII digits ending at `end` (exclusive), or None if any
+/// is not a digit. Reads the 8 bytes before `end`.
+///
+/// # Safety
+/// `end - 8 .. end` must be readable.
+#[inline(always)]
+pub unsafe fn digits_tail(end: *const u8, len: usize) -> Option<u64> {
+    debug_assert!((1..=8).contains(&len));
+    let w = (end.sub(8) as *const u64).read_unaligned();
+    let low = (8 - len) * 8; // bits before the field, replaced by '0'
+    let mask = if low == 0 { 0 } else { (1u64 << low) - 1 };
+    let w = (w & !mask) | (0x3030_3030_3030_3030 & mask);
+    if crate::ts::digits8(w) {
+        Some(crate::ts::value8(w))
+    } else {
+        None
+    }
+}
+
+/// `price`, reading up to 8 bytes before the field when `room` (at least 8
+/// readable bytes end at the field's end).
+#[inline(always)]
+pub fn price_fast(s: &[u8], room: bool) -> Option<u32> {
+    if room && (1..=8).contains(&s.len()) {
+        let v = unsafe { digits_tail(s.as_ptr().add(s.len()), s.len()) }?;
+        return if (1..=10_000_000).contains(&v) { Some(v as u32) } else { None };
+    }
+    price(s)
+}
+
 /// A purchase price: ASCII digits only, value 1 to 10,000,000.
 #[inline]
 pub fn price(s: &[u8]) -> Option<u32> {
@@ -187,6 +217,19 @@ mod tests {
         }
         big.extend_from_slice(b"end,no,newline");
         assert_eq!(scan_all::<3>(&big), split_all::<3>(&big));
+    }
+
+    #[test]
+    fn prices_fast() {
+        // Each candidate placed after 16 bytes of junk so the tail read is in bounds.
+        let cands: Vec<&[u8]> = vec![b"0250", b"1", b"0", b"00", b"10000000", b"10000001", b"99999999", b"12a4",
+            b"", b"+5", b"1000\r", b"0000000250", b"00000001", b"7", b"\xef\xbc\x92"];
+        for c in cands {
+            let mut v = b"0123456789,9,\"x,".to_vec();
+            v.extend_from_slice(c);
+            let f = &v[16..];
+            assert_eq!(price_fast(f, true), price(f), "{:?}", String::from_utf8_lossy(c));
+        }
     }
 
     #[test]

@@ -109,14 +109,14 @@ fn load8(s: &[u8], i: usize) -> u64 {
 
 /// True if all 8 bytes are ASCII digits.
 #[inline(always)]
-fn digits8(w: u64) -> bool {
+pub fn digits8(w: u64) -> bool {
     ((w & 0xF0F0_F0F0_F0F0_F0F0) | ((w.wrapping_add(0x0606_0606_0606_0606) & 0xF0F0_F0F0_F0F0_F0F0) >> 4))
         == 0x3333_3333_3333_3333
 }
 
 /// Value of 8 ASCII digits (first digit in the low byte).
 #[inline(always)]
-fn value8(w: u64) -> u64 {
+pub fn value8(w: u64) -> u64 {
     let w = w.wrapping_sub(0x3030_3030_3030_3030);
     let w = (w.wrapping_mul(10)).wrapping_add(w >> 8);
     let a = (w & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000 << 32));

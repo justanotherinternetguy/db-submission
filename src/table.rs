@@ -76,6 +76,23 @@ impl IdIndex {
         IdIndex { prefix: prefix.to_vec(), flat, map, keys: keys.to_vec() }
     }
 
+    /// `get`, reading up to 8 bytes before the key's end when `room`.
+    #[inline(always)]
+    pub fn get_fast(&self, k: &[u8], room: bool) -> Option<u32> {
+        if let Some(t) = &self.flat {
+            let pl = self.prefix.len();
+            let dl = k.len().wrapping_sub(pl);
+            if room && (1..=8).contains(&dl) && k[..pl] == self.prefix[..] && (k[pl] != b'0' || dl == 1) {
+                let n = unsafe { crate::csv::digits_tail(k.as_ptr().add(k.len()), dl) }?;
+                return match t.get(n as usize) {
+                    Some(&v) if v != u32::MAX => Some(v),
+                    _ => None,
+                };
+            }
+        }
+        self.get(k)
+    }
+
     #[inline]
     pub fn get(&self, k: &[u8]) -> Option<u32> {
         if let Some(t) = &self.flat {
