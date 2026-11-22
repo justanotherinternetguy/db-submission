@@ -21,7 +21,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::hint::black_box;
 use std::path::Path;
 use std::time::Instant;
-use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
+use xxhash_rust::xxh3::xxh3_64;
 
 #[derive(Default, Clone, Copy)]
 pub struct IdHasher(u64);
@@ -38,19 +38,6 @@ impl Hasher for IdHasher {
 }
 pub type IdBuild = BuildHasherDefault<IdHasher>;
 
-#[derive(Clone, Copy, Default)]
-#[repr(C)]
-struct E1 {
-    eid: u64,
-    ingest: i64,
-    uhash: u64,
-    uptr: u64,
-    eid2: u32,
-    ts: u32,
-    price: u32,
-    cat: u16,
-    ok: u16,
-}
 
 fn load(dir: &Path, mb: usize) -> Vec<u8> {
     let mut paths: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
@@ -212,7 +199,7 @@ fn main() {
             let mut x = 0u64;
             for &(s, e) in &chunks {
                 csv::scan::<7>(&body[s..e], &mut buf, |f| {
-                    x = x.wrapping_add(xxh3_128(f[0]) as u64 ^ table::uhash(f[1]))
+                    x = x.wrapping_add(table::ekey(f[0]) as u64 ^ table::uhash(f[1]))
                 });
             }
             x
@@ -248,23 +235,34 @@ fn main() {
     }
     one!("ts2", f, ts::parse(f[2]).unwrap_or(7) as u64);
     one!("ts3", f, ts::parse(f[3]).unwrap_or(7) as u64);
-    one!("h128", f, xxh3_128(f[0]) as u64);
+    one!("h128", f, table::ekey(f[0]) as u64);
     one!("h64", f, table::uhash(f[1]));
     one!("cat1", f, match products.get_fast(f[5], room(f[5])) { Some(i) => pcat[i as usize] as u64, None => 99 });
     one!("price", f, csv::price_fast(f[6], room(f[6])).unwrap_or(1) as u64);
     if run("full") {
-        let mut out: Vec<E1> = Vec::with_capacity(lines + 16);
+        // Mirrors the pass-1 event closure of main.rs (24 B key + 24 B person
+        // records), minus the person lookup and scatter.
+        const M40: u64 = (1 << 40) - 1;
+        let ingest_secs = |s: &[u8]| -> u64 {
+            match ts::parse_f1(s).or_else(|| ts::parse(s)) {
+                Some(ms) => (ms.div_euclid(1000) + 62_167_219_200).clamp(0, M40 as i64 - 1) as u64,
+                None => M40,
+            }
+        };
+        let mut keys: Vec<[u64; 3]> = Vec::with_capacity(lines + 16);
+        let mut pend: Vec<(u64, [u64; 3], [u64; 3])> = Vec::with_capacity(lines + 16);
         bench("full", lines, reps, || {
-            out.clear();
+            keys.clear();
+            pend.clear();
             for &(s, e) in &chunks {
                 csv::scan::<7>(&body[s..e], &mut buf, |f| {
                     let eid = f[0];
                     if eid.is_empty() {
                         return;
                     }
-                    let h = xxh3_128(eid);
-                    let ingest = ts::parse_f1(f[3]).or_else(|| ts::parse(f[3])).unwrap_or(i64::MAX);
-                    let mut r = E1 { eid: h as u64, eid2: (h >> 64) as u32, ingest, ..Default::default() };
+                    let h = table::ekey(eid);
+                    let ing = ingest_secs(f[3]);
+                    let kr = [(h as u64).max(1), (((h >> 64) as u64) << 40) | ing, ((h >> 88) as u64) << 48];
                     'v: {
                         let uid = f[1];
                         if uid.is_empty() {
@@ -290,23 +288,23 @@ fn main() {
                         } else {
                             0
                         };
-                        if (ingest as i128) - (t as i128) > 86_400_000 {
+                        let ingest_ms = (ing as i64 - 62_167_219_200) * 1000;
+                        if ing == M40 || (ingest_ms as i128) - (t as i128) > 86_400_000 {
                             break 'v;
                         }
-                        r.ok = 1;
-                        r.ts = (t - base) as u32;
-                        r.price = price;
-                        r.cat = match products.get_fast(f[5], room(f[5])) {
+                        let uh = table::uhash(uid);
+                        let cat = match products.get_fast(f[5], room(f[5])) {
                             Some(i) => pcat[i as usize],
                             None => 99,
                         };
-                        r.uhash = table::uhash(uid);
-                        r.uptr = (uid.as_ptr() as usize - basep as usize) as u64;
+                        let gofs = (uid.as_ptr() as usize - basep as usize) as u64;
+                        pend.push((uh, kr, [0, gofs | (price as u64) << 40, ((t - base) as u64) | (cat as u64) << 32]));
+                        return;
                     }
-                    out.push(r);
+                    keys.push(kr);
                 });
             }
-            out.len() as u64
+            (keys.len() + pend.len()) as u64
         });
     }
 }

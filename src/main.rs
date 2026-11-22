@@ -28,7 +28,7 @@ use memmap2::Mmap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use table::{uhash, AtomicMap, IdIndex};
 use buf::ZeroVec;
-use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
+use xxhash_rust::xxh3::xxh3_64;
 
 pub const DAY: i64 = 86_400_000;
 const GAP: u32 = 1_800_000;
@@ -696,7 +696,7 @@ fn main() {
                 if eid.is_empty() {
                     return;
                 }
-                let kr = K::new(xxh3_128(eid), ingest_secs(f[3]));
+                let kr = K::new(table::ekey(eid), ingest_secs(f[3]));
                 'v: {
                     let uid = f[1];
                     if uid.is_empty() {
@@ -1138,7 +1138,7 @@ mod tests {
         assert!(ingest_secs(b"9999-12-31T23:59:59Z") < M40);
         assert_eq!(ingest_secs(b"nope"), M40);
         assert_eq!((a as i64 - 62_167_219_200) * 1000, 1_791_071_890_000);
-        let h = xxh3_128(b"e1");
+        let h = table::ekey(b"e1");
         let k1 = K::new(h, 5);
         let mut k2 = K::new(h, 9);
         k2.w2 |= 0x7fff_1234_5678;
