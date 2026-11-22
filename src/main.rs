@@ -303,6 +303,33 @@ fn par_run<S: Send, F: Fn(&mut S, usize) + Sync>(states: Vec<S>, ntasks: usize, 
     })
 }
 
+/// `par_run`, then `fin(worker index, state)` on each worker as soon as it
+/// runs out of tasks (overlapping the others' last tasks).
+fn par_run_fin<S: Send, F: Fn(&mut S, usize) + Sync, G: Fn(usize, &mut S) + Sync>(states: Vec<S>, ntasks: usize, f: F, fin: G) -> Vec<S> {
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = states
+            .into_iter()
+            .enumerate()
+            .map(|(w, mut st)| {
+                let (next, f, fin) = (&next, &f, &fin);
+                scope.spawn(move || {
+                    loop {
+                        let t = next.fetch_add(1, Ordering::Relaxed);
+                        if t >= ntasks {
+                            break;
+                        }
+                        f(&mut st, t);
+                    }
+                    fin(w, &mut st);
+                    st
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
 // ---------------------------------------------------------------- files
 
 fn list_csv(dir: &Path) -> Vec<PathBuf> {
@@ -943,7 +970,24 @@ fn main() {
             cats: Vec::new(),
         })
         .collect();
-    let s3 = par_run(s3, nq, |st, q| {
+    // Largest partitions first (a whale person's can be many times the mean),
+    // so no big one is left for the end.
+    let mut q_order: Vec<(usize, usize)> =
+        (0..nq).map(|q| (s1_ev.iter().map(|s| s.len(q)).sum::<usize>() + s1_cl.iter().map(|s| s.len(q)).sum::<usize>(), q)).collect();
+    q_order.sort_unstable_by(|a, b| b.cmp(a));
+    // Each worker writes its user_daily file as soon as it runs out of partitions.
+    let ud = out_dir.join("user_daily");
+    let cd = out_dir.join("campaign_daily");
+    std::fs::create_dir_all(&ud).expect("mkdir user_daily");
+    std::fs::create_dir_all(&cd).expect("mkdir campaign_daily");
+    let write_users = |t: usize, st: &mut S3| {
+        if !st.users.is_empty() || t == 0 {
+            out::write_user_daily(&ud.join(format!("part-{t:03}.parquet")), &st.users, &store, &ctx.categories)
+                .expect("write user_daily");
+        }
+    };
+    let s3 = par_run_fin(s3, nq, |st, t| {
+        let q = q_order[t].1;
         let n: usize = s1_ev.iter().map(|s| s.len(q)).sum();
         if n == 0 {
             return;
@@ -1065,7 +1109,7 @@ fn main() {
         }
         st.evs = evs;
         st.cls = cls;
-    });
+    }, write_users);
 
     fn each<T: Copy + Default>(v: &[Scatter<T>], q: usize, mut f: impl FnMut(&T)) {
         for s in v {
@@ -1184,12 +1228,7 @@ fn main() {
     std::mem::forget((s1_ev, s1_cl, pool));
     lap("pass 3: sessions");
 
-    // ---- output
-    let ud = out_dir.join("user_daily");
-    let cd = out_dir.join("campaign_daily");
-    std::fs::create_dir_all(&ud).expect("mkdir user_daily");
-    std::fs::create_dir_all(&cd).expect("mkdir campaign_daily");
-
+    // ---- output (user_daily was written at the end of pass 3)
     let mut camp_total = vec![[0u64; 4]; (ncamp + 1) * ndays];
     for s in &s3 {
         for (a, b) in camp_total.iter_mut().zip(&s.camp) {
@@ -1198,27 +1237,7 @@ fn main() {
             }
         }
     }
-    std::thread::scope(|scope| {
-        for (t, s) in s3.iter().enumerate() {
-            let ud = &ud;
-            let store = &store;
-            let ctx = &ctx;
-            if s.users.is_empty() && t > 0 {
-                continue;
-            }
-            scope.spawn(move || {
-                out::write_user_daily(&ud.join(format!("part-{t:03}.parquet")), &s.users, store, &ctx.categories)
-                    .expect("write user_daily");
-            });
-        }
-        let cd = &cd;
-        let ctx = &ctx;
-        let camp_total = &camp_total;
-        scope.spawn(move || {
-            out::write_campaign_daily(&cd.join("part-000.parquet"), camp_total, ctx, ncamp)
-                .expect("write campaign_daily");
-        });
-    });
+    out::write_campaign_daily(&cd.join("part-000.parquet"), &camp_total, &ctx, ncamp).expect("write campaign_daily");
     lap("output");
     // Exit without unmapping or freeing: the kernel does it faster.
     std::process::exit(0);
