@@ -9,6 +9,7 @@ memmap2 = "0.9"
 memchr = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 parquet = { version = "56", default-features = false }
+libc = "0.2"
 
 [profile.release]
 opt-level = 3
@@ -16,3 +17,7 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = false
+
+[profile.profiling]
+inherits = "release"
+debug = true

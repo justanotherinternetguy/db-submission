@@ -119,7 +119,7 @@ pub fn write_campaign_daily(path: &Path, acc: &[[u64; 4]], ctx: &Ctx, ncamp: usi
                 id.push(ByteArray::from("organic"));
                 ch.push(ByteArray::from("organic"));
             } else {
-                id.push(ByteArray::from(ctx.campaigns.keys[c].clone()));
+                id.push(ByteArray::from(ctx.campaign_ids[c].clone()));
                 ch.push(ByteArray::from(ctx.channels[c].clone()));
             }
             day.push((ctx.day0 + d as i64) as i32);

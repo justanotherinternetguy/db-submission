@@ -440,6 +440,7 @@ name = "sessions"
 version = "0.1.0"
 dependencies = [
  "hashbrown 0.15.5",
+ "libc",
  "memchr",
  "memmap2",
  "parquet",
