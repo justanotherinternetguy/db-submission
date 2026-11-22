@@ -95,36 +95,6 @@ pub fn price(s: &[u8]) -> Option<u32> {
 }
 
 
-/// Per 64-byte block: bit i set where byte i is a separator (`,` or `\n`), a
-/// newline, or a quote.
-#[inline(always)]
-fn masks(b: &[u8; 64]) -> (u64, u64, u64) {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    unsafe {
-        use std::arch::x86_64::*;
-        let lo = _mm256_loadu_si256(b.as_ptr() as *const __m256i);
-        let hi = _mm256_loadu_si256(b.as_ptr().add(32) as *const __m256i);
-        let comma = _mm256_set1_epi8(b',' as i8);
-        let nl = _mm256_set1_epi8(b'\n' as i8);
-        let quote = _mm256_set1_epi8(b'"' as i8);
-        let m = |v: __m256i, c: __m256i| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, c)) as u32 as u64;
-        let n = m(lo, nl) | (m(hi, nl) << 32);
-        let c = m(lo, comma) | (m(hi, comma) << 32);
-        let q = m(lo, quote) | (m(hi, quote) << 32);
-        (c | n, n, q)
-    }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-    {
-        let (mut s, mut n, mut q) = (0u64, 0u64, 0u64);
-        for (i, &c) in b.iter().enumerate() {
-            s |= ((c == b',' || c == b'\n') as u64) << i;
-            n |= ((c == b'\n') as u64) << i;
-            q |= ((c == b'"') as u64) << i;
-        }
-        (s, n, q)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,12 +218,22 @@ mod tests {
 /// Calls `emit` with the `N` unquoted fields of every well-formed line in
 /// `data` (lines end at `\n`; the last may be unterminated). Malformed lines
 /// (wrong field count, a quote anywhere but around a whole field, empty lines)
-/// are skipped: the same dialect as `split`.
+/// are skipped: the same dialect as `split`. `buf` is scratch space.
 #[inline(always)]
 pub fn scan<'a, const N: usize>(data: &'a [u8], buf: &mut Vec<u64>, mut emit: impl FnMut(&[&'a [u8]; N])) {
-    // Sub-chunks of about 64 KiB cut at newlines keep `buf` in L2.
+    // The first line goes through `split`, so that a readable byte precedes
+    // every block (`scan_block` reads the byte before a field's end).
     let n = data.len();
-    let mut s = 0;
+    let first = match memchr::memchr(b'\n', data) {
+        Some(i) => i,
+        None => n,
+    };
+    let mut f: [&'a [u8]; N] = [&[]; N];
+    if n > 0 && split::<N>(&data[..first], &mut f) {
+        emit(&f);
+    }
+    // Sub-chunks of about 64 KiB cut at newlines keep `buf` in L2.
+    let mut s = first + 1;
     while s < n {
         let mut e = (s + (64 << 10)).min(n);
         if e < n {
@@ -264,9 +244,32 @@ pub fn scan<'a, const N: usize>(data: &'a [u8], buf: &mut Vec<u64>, mut emit: im
     }
 }
 
-/// Two-stage scanner: (1) flatten every separator into `buf` as
-/// pos << 32 | quotes-before-pos << 1 | is_newline, (2) walk lines N
-/// entries at a time. `data.len()` must be < 2^31.
+/// Writes the positions `base + i` of the set bits `i` of `bits` to `out`,
+/// W at a time (up to W - 1 slots past the count may be written); returns the count.
+#[inline(always)]
+unsafe fn flatten<const W: usize>(out: *mut u32, base: u32, mut bits: u64) -> usize {
+    let cnt = bits.count_ones() as usize;
+    let mut k = 0;
+    loop {
+        for j in 0..W {
+            *out.add(k + j) = base + bits.trailing_zeros();
+            bits &= bits.wrapping_sub(1);
+        }
+        k += W;
+        if k >= cnt {
+            break;
+        }
+    }
+    cnt
+}
+
+/// Two-stage scanner. Stage 1 records, per 64-byte block, the comma
+/// positions, the newline positions, and the quote mask with the running quote
+/// count before the block. Stage 2 walks lines: a line is well-formed when
+/// exactly `N - 1` commas precede its newline and its quote count is twice the
+/// number of fields that are wrapped whole in quotes (every quote is then one
+/// of those wrapping pairs). `data.len()` must be < 2^31, and the byte
+/// before `data` must be readable.
 #[inline(always)]
 fn scan_block<'a, const N: usize>(data: &'a [u8], buf: &mut Vec<u64>, emit: &mut impl FnMut(&[&'a [u8]; N])) {
     let n = data.len();
@@ -274,14 +277,24 @@ fn scan_block<'a, const N: usize>(data: &'a [u8], buf: &mut Vec<u64>, emit: &mut
         return;
     }
     debug_assert!(n < (1 << 31));
+    let nb = n.div_ceil(64);
+    // u64 words: commas (n + 64 u32s, + N sentinels), newlines (same), quote masks (nb), counts (nb).
+    let sep_cap = n + 64 + 2 * N;
+    let words = sep_cap + 2 * nb + 4;
     buf.clear();
-    buf.reserve(n + 128); // at most one entry per byte, plus unrolled slack
-    let out = buf.as_mut_ptr();
-    let mut len = 0usize;
-    let mut cq = 0u64;
-    let mut bs = 0usize;
+    buf.reserve(words);
+    let base = buf.as_mut_ptr();
+    let com = base as *mut u32;
+    let nls = unsafe { com.add(sep_cap) };
+    let qm = unsafe { base.add(sep_cap) }; // after 2 * sep_cap u32s
+    let qc = unsafe { qm.add(nb) as *mut u32 };
+    let mut ncom = 0usize;
+    let mut nnl = 0usize;
+    let mut cq = 0u32;
     let mut tail = [0u8; 64];
-    while bs < n {
+    let mut b = 0usize;
+    while b < nb {
+        let bs = b * 64;
         let block: &[u8; 64] = if bs + 64 <= n {
             unsafe { &*(data.as_ptr().add(bs) as *const [u8; 64]) }
         } else {
@@ -289,86 +302,98 @@ fn scan_block<'a, const N: usize>(data: &'a [u8], buf: &mut Vec<u64>, emit: &mut
             tail[n - bs..].fill(0);
             &tail
         };
-        let (sep, nl, quo) = masks(block);
-        let cnt = sep.count_ones() as usize;
-        let mut bits = sep;
-        let mut k = 0;
-        // Write 4 entries per step, possibly past `cnt` (slack reserved; ignored).
-        while k < cnt {
-            for _ in 0..4 {
-                let i = bits.trailing_zeros();
-                let below = 1u64.wrapping_shl(i).wrapping_sub(1);
-                let cum = cq + (quo & below).count_ones() as u64;
-                let isnl = (nl.wrapping_shr(i)) & 1;
-                unsafe { *out.add(len + k) = ((bs as u64 + i as u64) << 32) | (cum << 1) | isnl };
-                bits &= bits.wrapping_sub(1);
-                k += 1;
-            }
+        let (c, nl, q) = masks3(block);
+        unsafe {
+            *qm.add(b) = q;
+            *qc.add(b) = cq;
+            cq += q.count_ones();
+            ncom += flatten::<8>(com.add(ncom), bs as u32, c);
+            nnl += flatten::<2>(nls.add(nnl), bs as u32, nl);
         }
-        len += cnt;
-        cq += quo.count_ones() as u64;
-        bs += 64;
+        b += 1;
     }
-    unsafe { buf.set_len(len) };
-    let e = &buf[..];
-    let pos = |x: u64| (x >> 32) as usize;
-    let cum = |x: u64| ((x >> 1) & 0x7FFF_FFFF) as u32;
+    // Sentinels: no line has a comma at or after u32::MAX.
+    for j in 0..N {
+        unsafe { *com.add(ncom + j) = u32::MAX };
+    }
+    let com = unsafe { std::slice::from_raw_parts(com as *const u32, ncom + N) };
+    let nls = unsafe { std::slice::from_raw_parts(nls as *const u32, nnl) };
+    let quotes_before = |p: usize| unsafe {
+        let w = *qm.add(p >> 6);
+        let below = w & ((1u64 << (p & 63)) - 1);
+        *qc.add(p >> 6) + below.count_ones()
+    };
+
+    let dp = data.as_ptr();
     let mut fields: [&'a [u8]; N] = [&[]; N];
-    let mut k = 0usize;
-    let mut line_start = 0usize;
-    let mut q0 = 0u32;
-    while k < len {
-        if k + N <= len {
-            let mut flags = 0u64;
+    let mut c = 0usize; // first comma after the line start
+    let mut ls = 0usize; // line start
+    let mut qprev = 0u32; // quotes before the line start
+    for &le in nls {
+        let le = le as usize;
+        let qnow = quotes_before(le);
+        let ok_count = N == 1 || (unsafe { *com.get_unchecked(c + N - 2) } as usize) < le;
+        let next = unsafe { *com.get_unchecked(c + N - 1) } as usize;
+        if ok_count && next > le {
+            let mut start = ls;
+            let mut wrapped = 0u32;
             for j in 0..N {
-                flags |= (e[k + j] & 1) << j;
+                let end = if j + 1 < N { (unsafe { *com.get_unchecked(c + j) }) as usize } else { le };
+                // Branch-free: whether a field is quoted is unpredictable.
+                // start < n; the byte before `data` is readable (see `scan`).
+                let first = unsafe { *dp.add(start) };
+                let last = unsafe { *dp.add(end).sub(1) };
+                let w = (first == b'"') & (last == b'"') & (end >= start + 2);
+                wrapped += w as u32;
+                let q = w as usize;
+                fields[j] = unsafe { std::slice::from_raw_parts(dp.add(start + q), end - start - 2 * q) };
+                start = end + 1;
             }
-            if flags == 1 << (N - 1) {
-                let last = e[k + N - 1];
-                let mut start = line_start;
-                let mut qprev = q0;
-                let mut bad = false;
-                for j in 0..N {
-                    let x = e[k + j];
-                    let end = pos(x);
-                    // Branch-free: whether a line or field is quoted is unpredictable.
-                    let qc = cum(x) - qprev;
-                    qprev = cum(x);
-                    let quoted = qc != 0;
-                    let first = unsafe { *data.get_unchecked(start.min(n - 1)) };
-                    let lastc = unsafe { *data.get_unchecked(end.saturating_sub(1)) };
-                    let good = (qc == 2) & (end >= start + 2) & (first == b'"') & (lastc == b'"');
-                    bad |= quoted & !good;
-                    let q = quoted as usize;
-                    let s2 = (start + q).min(end);
-                    let e2 = end.saturating_sub(q).max(s2);
-                    fields[j] = unsafe { data.get_unchecked(s2..e2) };
-                    start = end + 1;
-                }
-                if !bad {
-                    emit(&fields);
-                }
-                line_start = pos(last) + 1;
-                q0 = cum(last);
-                k += N;
-                continue;
+            if qnow - qprev == 2 * wrapped {
+                emit(&fields);
+            }
+            c += N - 1;
+        } else {
+            while (unsafe { *com.get_unchecked(c) } as usize) < le {
+                c += 1;
             }
         }
-        // Malformed field count: skip to the next newline.
-        while k < len && e[k] & 1 == 0 {
-            k += 1;
-        }
-        if k < len {
-            line_start = pos(e[k]) + 1;
-            q0 = cum(e[k]);
-            k += 1;
-        }
+        qprev = qnow;
+        ls = le + 1;
     }
     // An unterminated last line.
-    if line_start < n {
+    if ls < n {
         let mut f: [&'a [u8]; N] = [&[]; N];
-        if split::<N>(&data[line_start..], &mut f) {
+        if split::<N>(&data[ls..], &mut f) {
             emit(&f);
         }
+    }
+}
+
+/// Per 64-byte block: bit i set where byte i is a comma, a newline, a quote.
+#[inline(always)]
+fn masks3(b: &[u8; 64]) -> (u64, u64, u64) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let lo = _mm256_loadu_si256(b.as_ptr() as *const __m256i);
+        let hi = _mm256_loadu_si256(b.as_ptr().add(32) as *const __m256i);
+        let m = |c: u8| {
+            let c = _mm256_set1_epi8(c as i8);
+            let l = _mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, c)) as u32 as u64;
+            let h = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, c)) as u32 as u64;
+            l | (h << 32)
+        };
+        (m(b','), m(b'\n'), m(b'"'))
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        let (mut c, mut n, mut q) = (0u64, 0u64, 0u64);
+        for (i, &x) in b.iter().enumerate() {
+            c |= ((x == b',') as u64) << i;
+            n |= ((x == b'\n') as u64) << i;
+            q |= ((x == b'"') as u64) << i;
+        }
+        (c, n, q)
     }
 }

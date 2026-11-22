@@ -124,47 +124,106 @@ pub fn value8(w: u64) -> u64 {
     (a.wrapping_add(b)) >> 32
 }
 
-/// Replace the bytes selected by `mask` (which must equal `expect`) with '0'.
-#[inline(always)]
-fn seps(w: u64, mask: u64, expect: u64) -> (bool, u64) {
-    ((w & mask) == expect, (w & !mask) | (0x3030_3030_3030_3030 & mask))
+/// A direct-mapped per-thread memo of dates: `YYYY-MM-DD` -> days since the
+/// epoch. Only valid dates are stored, so a hit also validates the date.
+#[derive(Clone, Copy)]
+struct DateSlot {
+    k: u64, // bytes 2..10, "YY-MM-DD"
+    c: u32, // bytes 0..2, "YY"
+    days: i32,
+}
+
+const VALID: u32 = 1 << 16;
+
+thread_local! {
+    static DATES: std::cell::UnsafeCell<[DateSlot; 256]> =
+        const { std::cell::UnsafeCell::new([DateSlot { k: 0, c: 0, days: 0 }; 256]) };
 }
 
 #[inline(always)]
-fn byte(w: u64, i: u32) -> i64 {
-    ((w >> (8 * i)) & 0xFF) as i64 - 0x30
+fn load2(s: &[u8], i: usize) -> u32 {
+    u16::from_le_bytes(s[i..i + 2].try_into().unwrap()) as u32
 }
 
-const B: [u64; 8] = [0xFF, 0xFF << 8, 0xFF << 16, 0xFF << 24, 0xFF << 32, 0xFF << 40, 0xFF << 48, 0xFF << 56];
-
+/// Days since the epoch of the date in `s[0..10]` (`YYYY-MM-DD`), if valid.
 #[inline(always)]
-fn rep(c: u8, i: usize) -> u64 {
-    (c as u64) << (8 * i)
+fn date(s: &[u8]) -> Option<i64> {
+    let k = load8(s, 2);
+    let c = load2(s, 0);
+    let i = (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize;
+    DATES.with(|m| {
+        let e = unsafe { (*m.get()).get_unchecked(i) };
+        if e.k == k && e.c == c | VALID {
+            Some(e.days as i64)
+        } else {
+            date_miss(s, i, m)
+        }
+    })
 }
 
-/// Fields shared by F1 and F2: returns (ok, seconds since epoch of the local time).
+#[cold]
+#[inline(never)]
+fn date_miss(s: &[u8], i: usize, m: &std::cell::UnsafeCell<[DateSlot; 256]>) -> Option<i64> {
+    if s[4] != b'-' || s[7] != b'-' {
+        return None;
+    }
+    let y = d2(s, 0)? * 100 + d2(s, 2)?;
+    let mo = d2(s, 5)?;
+    let d = d2(s, 8)?;
+    if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) {
+        return None;
+    }
+    let days = days_from_civil(y, mo, d);
+    unsafe { (*m.get())[i] = DateSlot { k: load8(s, 2), c: load2(s, 0) | VALID, days: days as i32 } };
+    Some(days)
+}
+
+/// True if no byte of `y` exceeds its limit in `max` (bytes <= 0x7F).
 #[inline(always)]
-fn civil_part(s: &[u8]) -> (bool, i64) {
-    // "YYYY-MM-" "DDTHH:MM" ":SS" checked as three overlapping words.
-    let (ok0, w0) = seps(load8(s, 0), B[4] | B[7], rep(b'-', 4) | rep(b'-', 7));
-    let (ok1, w1) = seps(load8(s, 8), B[2] | B[5], rep(b'T', 2) | rep(b':', 5));
-    // bytes 11..19: "HH:MM:SS"
-    let (ok2, w2) = seps(load8(s, 11), B[2] | B[5], rep(b':', 2) | rep(b':', 5));
-    let ok = ok0 & ok1 & ok2 & digits8(w0) & digits8(w1) & digits8(w2);
-    let y = byte(w0, 0) * 1000 + byte(w0, 1) * 100 + byte(w0, 2) * 10 + byte(w0, 3);
-    let mo = byte(w0, 5) * 10 + byte(w0, 6);
-    let d = byte(w1, 0) * 10 + byte(w1, 1);
-    let h = byte(w2, 0) * 10 + byte(w2, 1);
-    let mi = byte(w2, 3) * 10 + byte(w2, 4);
-    let se = byte(w2, 6) * 10 + byte(w2, 7);
-    let ok = ok
-        & (1..=12).contains(&mo)
-        & (d >= 1)
-        & (d <= days_in_month(y, mo.clamp(1, 12)))
-        & (h <= 23)
-        & (mi <= 59)
-        & (se <= 59);
-    (ok, days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se)
+fn within(y: u64, max: u64) -> bool {
+    let t = y.wrapping_add(0x7F7F_7F7F_7F7F_7F7F - max);
+    (y | t) & 0x8080_8080_8080_8080 == 0
+}
+
+/// Seconds of the day of `HH:MM:SS` at `s[11..19]`, if valid.
+#[inline(always)]
+fn time_of_day(s: &[u8]) -> Option<i64> {
+    // Digits become 0..9, colons 0.
+    let y = load8(s, 11) ^ u64::from_le_bytes(*b"00:00:00");
+    let ok = within(y, u64::from_le_bytes([2, 9, 0, 5, 9, 0, 5, 9]));
+    let t = y.wrapping_mul(10).wrapping_add(y >> 8); // pairs in bytes 0, 3, 6
+    let h = t & 0xFF;
+    let mi = (t >> 24) & 0xFF;
+    let se = (t >> 48) & 0xFF;
+    if ok & (h <= 23) {
+        Some((h * 3600 + mi * 60 + se) as i64)
+    } else {
+        None
+    }
+}
+
+/// Minutes of a `+HH:MM` / `-HH:MM` offset at `s[19..25]`, signed so that
+/// UTC = local - offset.
+#[inline(always)]
+fn offset(s: &[u8]) -> Option<i64> {
+    // bytes 17..25: "SS+HH:MM"; check bytes 3..8.
+    let w = load8(s, 17);
+    let y = (w ^ u64::from_le_bytes(*b"\0\0\000:00")) & !0xFF_FFFF;
+    let ok = within(y, u64::from_le_bytes([0, 0, 0, 2, 9, 0, 5, 9]));
+    let t = y.wrapping_mul(10).wrapping_add(y >> 8); // pairs in bytes 3, 6
+    let oh = (t >> 24) & 0xFF;
+    let om = (t >> 48) & 0xFF;
+    let sign = s[19];
+    let m = (oh * 60 + om) as i64;
+    if ok & (oh <= 23) {
+        match sign {
+            b'+' => Some(m),
+            b'-' => Some(-m),
+            _ => None,
+        }
+    } else {
+        None
+    }
 }
 
 #[inline(always)]
@@ -183,37 +242,22 @@ fn f3_slow(s: &[u8]) -> Option<i64> {
     Some(v as i64)
 }
 
+/// F1 only (`YYYY-MM-DDTHH:MM:SSZ`), for `ingest_ts`; None for anything else.
+#[inline(always)]
+pub fn parse_f1(s: &[u8]) -> Option<i64> {
+    if s.len() == 20 && s[10] == b'T' && s[19] == b'Z' {
+        let tod = time_of_day(s)?;
+        let d = date(s)?;
+        Some((d * 86_400 + tod) * 1000)
+    } else {
+        None
+    }
+}
+
 /// Milliseconds since the epoch for F1, F2 or F3; None for anything else.
 #[inline(always)]
 pub fn parse(s: &[u8]) -> Option<i64> {
     match s.len() {
-        20 if s[4] == b'-' => {
-            let (ok, secs) = civil_part(s);
-            if ok & (s[19] == b'Z') {
-                Some(secs * 1000)
-            } else {
-                None
-            }
-        }
-        25 if s[4] == b'-' => {
-            let (ok, secs) = civil_part(s);
-            // bytes 17..25: "SS+HH:MM"
-            let w = load8(s, 17);
-            let sign = (w >> 16) & 0xFF;
-            let (ok3, w3) = seps(w, B[2] | B[5], rep(b'0', 2) | rep(b':', 5));
-            let _ = ok3;
-            let colon = (w & B[5]) == rep(b':', 5);
-            let w3 = (w3 & !B[2]) | rep(b'0', 2);
-            let oh = byte(w3, 3) * 10 + byte(w3, 4);
-            let om = byte(w3, 6) * 10 + byte(w3, 7);
-            let ok = ok & colon & digits8(w3) & (oh <= 23) & (om <= 59) & ((sign == b'+' as u64) | (sign == b'-' as u64));
-            if ok {
-                let off = (oh * 60 + om) * 60;
-                Some((if sign == b'+' as u64 { secs - off } else { secs + off }) * 1000)
-            } else {
-                None
-            }
-        }
         13 => {
             let a = load8(s, 0);
             let b = load8(s, 5);
@@ -222,6 +266,13 @@ pub fn parse(s: &[u8]) -> Option<i64> {
             } else {
                 None
             }
+        }
+        20 if s[19] == b'Z' => parse_f1(s),
+        25 if s[10] == b'T' => {
+            let tod = time_of_day(s)?;
+            let off = offset(s)?;
+            let d = date(s)?;
+            Some((d * 86_400 + tod - off * 60) * 1000)
         }
         0 => None,
         _ => f3_slow(s),
@@ -277,6 +328,8 @@ mod tests {
                 }
             }
             assert_eq!(parse(&v), parse_slow(&v), "{:?}", String::from_utf8_lossy(&v));
+            let f1 = if v.len() == 20 && v[19] == b'Z' { parse_slow(&v) } else { None };
+            assert_eq!(super::parse_f1(&v), f1, "{:?}", String::from_utf8_lossy(&v));
         }
         // Every calendar day 1999..2031, and every offset.
         for days in days_from_civil(1999, 1, 1)..days_from_civil(2031, 1, 1) {
