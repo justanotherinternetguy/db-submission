@@ -5,36 +5,69 @@ use std::path::Path;
 use crate::pq::{write, Column, Kind};
 use crate::{Ctx, Store, URow};
 
-pub fn write_user_daily(path: &Path, rows: &[URow], store: &Store, categories: &[Vec<u8>]) -> std::io::Result<()> {
-    let mut user = Column::new("user_id", Kind::Str, false);
-    let mut day = Column::new("day", Kind::Date, false);
-    let mut sessions = Column::new("sessions", Kind::Int64, false);
-    let mut events = Column::new("events", Kind::Int64, false);
-    let mut revenue = Column::new("revenue_cents", Kind::Int64, false);
-    let mut top = Column::new("top_category", Kind::Str, true);
-    user.data.reserve(rows.len() * 16);
-    for c in [&mut day] {
-        c.data.reserve(rows.len() * 4);
-    }
-    for c in [&mut sessions, &mut events, &mut revenue] {
-        c.data.reserve(rows.len() * 8);
-    }
-    top.defined.reserve(rows.len());
-    let mut last: (u64, &[u8]) = (u64::MAX, &[]);
-    for r in rows {
-        // A person's rows are adjacent: resolve each name once.
-        if r.name != last.0 {
-            last = (r.name, store.get_name(r.name));
+/// A non-negative integer column at the smallest encoding that holds every
+/// value: a dictionary of 0..=max (the value is its own index) when max is
+/// small, else PLAIN INT32, else PLAIN INT64.
+fn int_column(name: &'static str, rows: &[URow], f: impl Fn(&URow) -> u64) -> Column {
+    let max = rows.iter().map(&f).max().unwrap_or(0);
+    if max < 1 << 16 && (max as usize) < rows.len() {
+        let mut c = Column::dictionary(name, Kind::Int32, false);
+        for v in 0..=max {
+            c.entry_i32(v as i32);
         }
-        user.put_str(last.1);
-        day.put_i32(r.day);
-        sessions.put_i64(r.sessions as i64);
-        events.put_i64(r.events as i64);
-        revenue.put_i64(r.revenue as i64);
+        c.idx.extend(rows.iter().map(|r| f(r) as u32));
+        c
+    } else if max <= i32::MAX as u64 {
+        let mut c = Column::new(name, Kind::Int32, false);
+        c.data.reserve(rows.len() * 4);
+        for r in rows {
+            c.put_i32(f(r) as i32);
+        }
+        c
+    } else {
+        let mut c = Column::new(name, Kind::Int64, false);
+        c.data.reserve(rows.len() * 8);
+        for r in rows {
+            c.put_i64(f(r) as i64);
+        }
+        c
+    }
+}
+
+pub fn write_user_daily(path: &Path, rows: &[URow], store: &Store, categories: &[Vec<u8>]) -> std::io::Result<()> {
+    // A person's rows are adjacent: each name enters the dictionary once.
+    let mut user = Column::dictionary("user_id", Kind::Str, false);
+    user.data.reserve(rows.len() * 8);
+    user.idx.reserve(rows.len());
+    let mut last = u64::MAX;
+    for r in rows {
+        if r.name != last {
+            last = r.name;
+            user.entry_str(store.get_name(r.name));
+        }
+        user.idx.push(user.dict.unwrap() as u32 - 1);
+    }
+    let d0 = rows.iter().map(|r| r.day).min().unwrap_or(0);
+    let d1 = rows.iter().map(|r| r.day).max().unwrap_or(0);
+    let mut day = Column::dictionary("day", Kind::Date, false);
+    for d in d0..=d1 {
+        day.entry_i32(d);
+    }
+    day.idx.extend(rows.iter().map(|r| (r.day - d0) as u32));
+    let sessions = int_column("sessions", rows, |r| r.sessions as u64);
+    let events = int_column("events", rows, |r| r.events as u64);
+    let revenue = int_column("revenue_cents", rows, |r| r.revenue);
+    let mut top = Column::dictionary("top_category", Kind::Str, true);
+    for c in categories {
+        top.entry_str(c);
+    }
+    top.idx.reserve(rows.len());
+    top.defined.reserve(rows.len());
+    for r in rows {
         if r.top == u32::MAX {
             top.put_null();
         } else {
-            top.put_str(&categories[r.top as usize]);
+            top.put_idx(r.top);
         }
     }
     write(path, "user_daily", &[user, day, sessions, events, revenue, top], rows.len())
