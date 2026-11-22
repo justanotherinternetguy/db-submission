@@ -70,6 +70,47 @@ pub fn price_fast(s: &[u8], room: bool) -> Option<u32> {
     price(s)
 }
 
+/// The bytes of a field of 1..=8 bytes as a little-endian word (zero above
+/// its length), read as one load of the 8 bytes ending at its end when
+/// `room`; None if longer, empty, or no room.
+#[inline(always)]
+pub fn word_tail(s: &[u8], room: bool) -> Option<u64> {
+    let len = s.len();
+    if room && (1..=8).contains(&len) {
+        let w = unsafe { (s.as_ptr().add(len).sub(8) as *const u64).read_unaligned() };
+        Some(w >> (8 * (8 - len)))
+    } else {
+        None
+    }
+}
+
+/// event_type: Some(true) for `purchase`, Some(false) for `view` / `cart`,
+/// None for anything else (case-sensitive, exact).
+#[inline(always)]
+pub fn event_type(s: &[u8], room: bool) -> Option<bool> {
+    const VIEW: u64 = u32::from_le_bytes(*b"view") as u64;
+    const CART: u64 = u32::from_le_bytes(*b"cart") as u64;
+    const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
+    match word_tail(s, room) {
+        Some(w) => {
+            let len = s.len();
+            if (w == PURCHASE) & (len == 8) {
+                Some(true)
+            } else if ((w == VIEW) | (w == CART)) & (len == 4) {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        None if room && s.len() > 8 => None,
+        None => match s {
+            b"view" | b"cart" => Some(false),
+            b"purchase" => Some(true),
+            _ => None,
+        },
+    }
+}
+
 /// A purchase price: ASCII digits only, value 1 to 10,000,000.
 #[inline]
 pub fn price(s: &[u8]) -> Option<u32> {
@@ -199,6 +240,24 @@ mod tests {
             v.extend_from_slice(c);
             let f = &v[16..];
             assert_eq!(price_fast(f, true), price(f), "{:?}", String::from_utf8_lossy(c));
+        }
+    }
+
+    #[test]
+    fn event_types() {
+        let cands: Vec<&[u8]> = vec![b"view", b"cart", b"purchase", b"Purchase", b"cart ", b"vie", b"\0view", b"",
+            b"purchases", b"purchas", b"view\0", b"xview", b"\0\0\0\0view"];
+        for c in cands {
+            let mut v = b"0123456789,9,\"x,".to_vec();
+            v.extend_from_slice(c);
+            let f = &v[16..];
+            let want = match c {
+                b"view" | b"cart" => Some(false),
+                b"purchase" => Some(true),
+                _ => None,
+            };
+            assert_eq!(event_type(f, true), want, "{:?}", String::from_utf8_lossy(c));
+            assert_eq!(event_type(c, false), want, "{:?}", String::from_utf8_lossy(c));
         }
     }
 
@@ -373,7 +432,15 @@ fn scan_block<'a, const N: usize>(data: &'a [u8], buf: &mut Vec<u64>, emit: &mut
 /// Per 64-byte block: bit i set where byte i is a comma, a newline, a quote.
 #[inline(always)]
 fn masks3(b: &[u8; 64]) -> (u64, u64, u64) {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    // AVX-512BW byte compares into k-masks (no frequency licence cost).
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let v = _mm512_loadu_si512(b.as_ptr() as *const _);
+        let m = |c: u8| _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(c as i8));
+        (m(b','), m(b'\n'), m(b'"'))
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512bw")))]
     unsafe {
         use std::arch::x86_64::*;
         let lo = _mm256_loadu_si256(b.as_ptr() as *const __m256i);

@@ -710,10 +710,9 @@ fn main() {
                         Some(t) if t >= ctx.ws && t < ctx.we => t,
                         _ => break 'v,
                     };
-                    let purchase = match f[4] {
-                        b"view" | b"cart" => false,
-                        b"purchase" => true,
-                        _ => break 'v,
+                    let purchase = match csv::event_type(f[4], room(f[4])) {
+                        Some(p) => p,
+                        None => break 'v,
                     };
                     if f[5].is_empty() {
                         break 'v;
