@@ -12,6 +12,7 @@
 mod buf;
 mod csv;
 mod out;
+mod pq;
 mod table;
 mod ts;
 
