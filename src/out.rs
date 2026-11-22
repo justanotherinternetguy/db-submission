@@ -20,8 +20,13 @@ pub fn write_user_daily(path: &Path, rows: &[URow], store: &Store, categories: &
         c.data.reserve(rows.len() * 8);
     }
     top.defined.reserve(rows.len());
+    let mut last: (u64, &[u8]) = (u64::MAX, &[]);
     for r in rows {
-        user.put_str(store.get(r.name));
+        // A person's rows are adjacent: resolve each name once.
+        if r.name != last.0 {
+            last = (r.name, store.get_name(r.name));
+        }
+        user.put_str(last.1);
         day.put_i32(r.day);
         sessions.put_i64(r.sessions as i64);
         events.put_i64(r.events as i64);

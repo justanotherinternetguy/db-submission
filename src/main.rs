@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use buf::Parts;
+use buf::{Pool, Scatter};
 use memmap2::Mmap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use table::{uhash, AtomicMap, IdIndex};
@@ -76,6 +76,8 @@ fn mix64(mut z: u64) -> u64 {
 pub struct Store {
     maps: Vec<Mmap>,
     overflow: Mutex<Vec<&'static [u8]>>,
+    /// Per file: its first byte's global offset (files laid end to end).
+    gbase: Vec<u64>,
 }
 
 const OVERFLOW_FILE: u64 = 4095;
@@ -93,6 +95,26 @@ impl Store {
             v.push(leaked);
             (OVERFLOW_FILE << 52) | (((v.len() - 1) as u64) << 16)
         }
+    }
+
+    /// A name for `get_name`: the field value (ended by `,` or `"`) at global
+    /// offset `g`. Low 16 bits 0xFFFF never occur in a `Ptr`.
+    #[inline]
+    pub fn field_name(g: u64) -> u64 {
+        g << 16 | 0xFFFF
+    }
+
+    /// The bytes of a `Ptr` or of a `field_name`.
+    pub fn get_name(&self, n: u64) -> &[u8] {
+        if n & 0xFFFF != 0xFFFF {
+            return self.get(n);
+        }
+        let g = n >> 16;
+        let fi = self.gbase.partition_point(|&b| b <= g) - 1;
+        let m = &self.maps[fi];
+        let off = (g - self.gbase[fi]) as usize;
+        let len = memchr::memchr2(b',', b'"', &m[off..]).unwrap_or(m.len() - off);
+        &m[off..off + len]
     }
 
     #[inline]
@@ -156,31 +178,69 @@ impl Ctx {
 
 // ---------------------------------------------------------------- records
 
-/// One parsed event copy (pass 1).
+const M40: u64 = (1 << 40) - 1;
+const M48: u64 = (1 << 48) - 1;
+
+/// One event copy, for dedup (pass 1 -> 2): a 104-bit event_id key, ingest_ts
+/// in seconds since 0000-01-01 (40 bits), and the address of its `P` record
+/// (48 bits; null for an invalid copy).
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
-struct E1 {
-    eid: u64,
-    ingest: i64,
-    uhash: u64,
-    uptr: u64,
-    eid2: u32,
-    ts: u32,
-    price: u32,
-    cat: u16,
-    ok: u16,
+struct K {
+    w0: u64, // key bits 0..64, never 0; the top bits pick the partition
+    w1: u64, // key bits 64..88 << 40 | ingest
+    w2: u64, // key bits 88..104 << 48 | P address
 }
 
-/// A surviving event (pass 2).
+impl K {
+    #[inline(always)]
+    fn new(h: u128, ingest: u64) -> K {
+        K { w0: (h as u64).max(1), w1: (((h >> 64) as u64) << 40) | ingest, w2: ((h >> 88) as u64) << 48 }
+    }
+    #[inline(always)]
+    fn same(&self, o: &K) -> bool {
+        self.w0 == o.w0 && (self.w1 ^ o.w1) >> 40 == 0 && (self.w2 ^ o.w2) >> 48 == 0
+    }
+    #[inline(always)]
+    fn ingest(&self) -> u64 {
+        self.w1 & M40
+    }
+    /// Marks this copy's surviving record (if any) as a dedup loser.
+    #[inline(always)]
+    fn kill(&self) {
+        let p = (self.w2 & M48) as *mut P;
+        if !p.is_null() {
+            unsafe { (*p).dead = 1 };
+        }
+    }
+}
+
+/// ingest_ts (always F1 per the rules) as seconds since 0000-01-01, which
+/// orders every F1 value exactly; unparseable sorts last.
+#[inline(always)]
+fn ingest_secs(s: &[u8]) -> u64 {
+    match ts::parse(s) {
+        Some(ms) => (ms.div_euclid(1000) + 62_167_219_200).clamp(0, M40 as i64 - 1) as u64,
+        None => M40,
+    }
+}
+
+/// A valid event copy, by person (pass 1 -> 3).
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
-struct E2 {
+struct P {
     pkey: u64,
-    uptr: u64,
+    gp: u64, // global offset of its user_id (40 bits) | price << 40
     ts: u32,
-    price: u32,
-    cat: u32,
-    _pad: u32,
+    cat: u16,
+    dead: u16, // set by dedup for a losing copy
+}
+
+impl P {
+    #[inline(always)]
+    fn price(&self) -> u32 {
+        (self.gp >> 40) as u32
+    }
 }
 
 /// A valid click.
@@ -432,7 +492,14 @@ fn main() {
             m
         })
         .collect();
-    let store = Store { maps, overflow: Mutex::new(Vec::new()) };
+    let mut gbase = Vec::with_capacity(lens.len());
+    let mut g = 0u64;
+    for &l in &lens {
+        gbase.push(g);
+        g += l as u64;
+    }
+    assert!(g < M40, "input too large");
+    let store = Store { maps, overflow: Mutex::new(Vec::new()), gbase };
     let mut link_chunks = Vec::new();
     let mut main_chunks = Vec::new();
     let mut bytes = [0usize; 3];
@@ -575,39 +642,61 @@ fn main() {
     };
 
     // ---- pass 1: events and clicks
-    let ev_cap = est_events / (nthreads * np) * 13 / 10;
-    let cl_cap = est_clicks / (nthreads * nq) * 13 / 10;
+    // Valid event copies go straight to person partitions (P); every copy also
+    // leaves a K record in its event_id partition, pointing at its P record.
+    let pool = Pool::new(est_events * 2 * 48 + est_clicks * 2 * 24 + nthreads * (np + 2 * nq) * buf::BLK * 2);
+    const BATCH: usize = 32;
     struct S1 {
-        ev: Parts<E1>,
-        cl: Parts<C1>,
+        k: Scatter<K>,
+        ev: Scatter<P>,
+        cl: Scatter<C1>,
+        pend: Vec<(u64, K, P)>,
         pending: Vec<(u64, C1)>,
         buf: Vec<u64>,
         cpu: [f64; 3],
     }
-    let s1: Vec<S1> = std::thread::scope(|sc| {
-        let hs: Vec<_> = (0..nthreads)
-            .map(|_| sc.spawn(|| S1 { ev: Parts::new(np, ev_cap), cl: Parts::new(nq, cl_cap), pending: Vec::new(), buf: Vec::new(), cpu: [0.0; 3] }))
-            .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+    let s1: Vec<S1> = (0..nthreads)
+        .map(|_| S1 {
+            k: Scatter::new(np),
+            ev: Scatter::new(nq),
+            cl: Scatter::new(nq),
+            pend: Vec::with_capacity(BATCH),
+            pending: Vec::new(),
+            buf: Vec::new(),
+            cpu: [0.0; 3],
+        })
+        .collect();
+    /// Resolves the people of a batch of valid copies (their link slots were
+    /// prefetched when parsed) and scatters them.
+    #[inline(always)]
+    fn flush(ctx: &Ctx, pool: &Pool, pb: u32, pend: &mut Vec<(u64, K, P)>, k: &mut Scatter<K>, ev: &mut Scatter<P>) {
+        for &(uh, mut kr, mut pr) in pend.iter() {
+            pr.pkey = ctx.person(uh);
+            let at = ev.push(pool, ctx.qpart(pr.pkey), pr);
+            kr.w2 |= at as u64;
+            k.push(pool, (kr.w0 >> (64 - pb)) as usize, kr);
+        }
+        pend.clear();
+    }
     let s1 = par_run(s1, main_chunks.len(), |st, t| {
         let (fi, s, e, kind) = main_chunks[t];
         let m = &store.maps[fi];
         let basep = m.as_ptr();
         let ctx = &ctx;
+        let pool = &pool;
         // At least 8 readable bytes end at a field's end (the header precedes all data).
         let room = |f: &[u8]| f.as_ptr() as usize + f.len() >= basep as usize + 8;
         let tk = Instant::now();
         let _timer = Timer(&mut st.cpu[kind as usize] as *mut f64, tk);
         if kind == 1 {
-            csv::scan::<7>(&m[s..e], &mut st.buf, |f| {
+            let gb = (store.gbase[fi] as usize).wrapping_sub(basep as usize);
+            let S1 { k, ev, pend, buf, .. } = st;
+            csv::scan::<7>(&m[s..e], buf, |f| {
                 let eid = f[0];
                 if eid.is_empty() {
                     return;
                 }
-                let h = xxh3_128(eid);
-                let ingest = ts::parse(f[3]).unwrap_or(i64::MAX);
-                let mut r = E1 { eid: h as u64, eid2: (h >> 64) as u32, ingest, ..Default::default() };
+                let kr = K::new(xxh3_128(eid), ingest_secs(f[3]));
                 'v: {
                     let uid = f[1];
                     if uid.is_empty() {
@@ -633,18 +722,23 @@ fn main() {
                     } else {
                         0
                     };
-                    if (ingest as i128) - (t as i128) > LATE as i128 {
+                    let ingest_ms = (kr.ingest() as i64 - 62_167_219_200) * 1000;
+                    if kr.ingest() == M40 || (ingest_ms as i128) - (t as i128) > LATE as i128 {
                         break 'v;
                     }
-                    r.ok = 1;
-                    r.ts = (t - ctx.base) as u32;
-                    r.price = price;
-                    r.cat = ctx.category(f[5], room(f[5]));
-                    r.uhash = uhash(uid);
-                    r.uptr = store.ptr(fi, basep, uid);
+                    let uh = uhash(uid);
+                    ctx.links.prefetch(uh);
+                    let gofs = (uid.as_ptr() as usize).wrapping_add(gb) as u64;
+                    let pr = P { pkey: 0, gp: gofs | (price as u64) << 40, ts: (t - ctx.base) as u32, cat: ctx.category(f[5], room(f[5])), dead: 0 };
+                    pend.push((uh, kr, pr));
+                    if pend.len() >= BATCH {
+                        flush(ctx, pool, pb, pend, k, ev);
+                    }
+                    return;
                 }
-                st.ev.push((r.eid >> (64 - pb)) as usize, r);
+                k.push(pool, (kr.w0 >> (64 - pb)) as usize, kr);
             });
+            flush(ctx, pool, pb, pend, k, ev);
         } else {
             st.pending.clear();
             csv::scan::<4>(&m[s..e], &mut st.buf, |f| {
@@ -671,83 +765,52 @@ fn main() {
                 }
                 let (uh, mut c) = st.pending[i];
                 c.pkey = ctx.person(uh);
-                st.cl.push(ctx.qpart(c.pkey), c);
+                st.cl.push(pool, ctx.qpart(c.pkey), c);
             }
         }
     });
-    let n_e1: usize = s1.iter().map(|s| s.ev.total()).sum();
+    let n_k: usize = s1.iter().map(|s| s.k.total()).sum();
+    let n_p: usize = s1.iter().map(|s| s.ev.total()).sum();
     let n_c1: usize = s1.iter().map(|s| s.cl.total()).sum();
     let cpu_ev: f64 = s1.iter().map(|s| s.cpu[1]).sum();
     let cpu_cl: f64 = s1.iter().map(|s| s.cpu[2]).sum();
-    lap(&format!("pass 1: parse ({n_e1} event copies, {n_c1} valid clicks; cpu events {cpu_ev:.2}s clicks {cpu_cl:.2}s)"));
+    lap(&format!("pass 1: parse ({n_k} event copies, {n_p} valid, {n_c1} valid clicks; cpu events {cpu_ev:.2}s clicks {cpu_cl:.2}s)"));
 
-    // ---- pass 2: dedup events
-    #[derive(Clone, Copy, Default)]
-    #[repr(C)]
-    struct DSlot {
-        eid: u64,
-        eid2: u32,
-        loc: u32, // thread (5 bits) | index (27 bits); u32::MAX = empty
-    }
-    let e2_cap = n_e1 / (nthreads * nq) * 3 / 2 + 16;
-    struct S2 {
-        out: Parts<E2>,
-        table: Vec<DSlot>,
-        winners: Vec<u32>,
-    }
-    let s2: Vec<S2> = std::thread::scope(|sc| {
-        let hs: Vec<_> = (0..nthreads)
-            .map(|_| sc.spawn(|| S2 { out: Parts::new(nq, e2_cap), table: Vec::new(), winners: Vec::new() }))
-            .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    let s2 = par_run(s2, np, |st, p| {
-        let n: usize = s1.iter().map(|s| s.ev.len(p)).sum();
-        let size = (n * 2).next_power_of_two().max(16);
+    // ---- pass 2: dedup events. Per event_id: the copy with the smallest
+    // ingest wins (equal ingest: identical copies, keep one); every other
+    // copy's P record is marked dead. An invalid winner kills all its copies.
+    par_run((0..nthreads).map(|_| Vec::<K>::new()).collect(), np, |table, p| {
+        let n: usize = s1.iter().map(|s| s.k.len(p)).sum();
+        let size = (n + n / 2).next_power_of_two().max(16);
         let mask = size - 1;
-        st.table.clear();
-        st.table.resize(size, DSlot { eid: 0, eid2: 0, loc: u32::MAX });
-        let rec = |loc: u32| -> &E1 { s1[(loc >> 27) as usize].ev.get(p, (loc & ((1 << 27) - 1)) as usize) };
-        for (ti, s) in s1.iter().enumerate() {
-            for (i, r) in s.ev.iter(p).enumerate() {
-                let loc = ((ti as u32) << 27) | i as u32;
-                let mut k = (r.eid as usize) & mask;
-                loop {
-                    let slot = &mut st.table[k];
-                    if slot.loc == u32::MAX {
-                        *slot = DSlot { eid: r.eid, eid2: r.eid2, loc };
-                        break;
-                    }
-                    if slot.eid == r.eid && slot.eid2 == r.eid2 {
-                        if r.ingest < rec(slot.loc).ingest {
-                            slot.loc = loc;
+        table.clear();
+        table.resize(size, K::default());
+        for s in &s1 {
+            for b in s.k.blocks(p) {
+                for r in b {
+                    let mut i = (r.w0 as usize) & mask;
+                    loop {
+                        let t = unsafe { table.get_unchecked_mut(i) };
+                        if t.w0 == 0 {
+                            *t = *r;
+                            break;
                         }
-                        break;
+                        if t.same(r) {
+                            if r.ingest() < t.ingest() {
+                                t.kill();
+                                *t = *r;
+                            } else {
+                                r.kill();
+                            }
+                            break;
+                        }
+                        i = (i + 1) & mask;
                     }
-                    k = (k + 1) & mask;
                 }
             }
         }
-        st.winners.clear();
-        for slot in &st.table {
-            if slot.loc != u32::MAX && rec(slot.loc).ok != 0 {
-                st.winners.push(slot.loc);
-            }
-        }
-        let w = std::mem::take(&mut st.winners);
-        for i in 0..w.len() {
-            if i + PREFETCH < w.len() {
-                ctx.links.prefetch(rec(w[i + PREFETCH]).uhash);
-            }
-            let r = rec(w[i]);
-            let pkey = ctx.person(r.uhash);
-            st.out.push(ctx.qpart(pkey), E2 { pkey, uptr: r.uptr, ts: r.ts, price: r.price, cat: r.cat as u32, _pad: 0 });
-        }
-        st.winners = w;
     });
-    let (s1_cl, s1_ev): (Vec<Parts<C1>>, Vec<Parts<E1>>) = s1.into_iter().map(|s| (s.cl, s.ev)).unzip();
-    // Never freed: the process exits without unmapping, which is faster.
-    std::mem::forget(s1_ev);
+    let (s1_cl, s1_ev): (Vec<Scatter<C1>>, Vec<Scatter<P>>) = s1.into_iter().map(|s| (s.cl, s.ev)).unzip();
     lap("pass 2: dedup");
 
     // ---- pass 3: sessions
@@ -761,7 +824,7 @@ fn main() {
         pid: Vec<u32>,        // per event: local person id
         start: Vec<u32>,      // per person: offset into evs (n+1)
         cstart: Vec<u32>,     // per person: offset into cls (n+1)
-        evs: Vec<E2>,
+        evs: Vec<P>,
         cls: Vec<C1>,
         cats: Vec<(u32, u64)>,
     }
@@ -782,7 +845,7 @@ fn main() {
         })
         .collect();
     let s3 = par_run(s3, nq, |st, q| {
-        let n: usize = s2.iter().map(|s| s.out.len(q)).sum();
+        let n: usize = s1_ev.iter().map(|s| s.len(q)).sum();
         if n == 0 {
             return;
         }
@@ -795,8 +858,11 @@ fn main() {
         st.pid.clear();
         st.start.clear();
         let mut npeople = 0u32;
-        for s in &s2 {
-            for e in s.out.iter(q) {
+        each(&s1_ev, q, |e| {
+            if e.dead != 0 {
+                return;
+            }
+            {
                 let mut k = (mix64(e.pkey) as usize) & mask;
                 let id = loop {
                     let key = st.local[k];
@@ -815,7 +881,7 @@ fn main() {
                 st.pid.push(id);
                 st.start[id as usize] += 1;
             }
-        }
+        });
         // Counting sort events by person.
         let mut acc = 0u32;
         for c in st.start.iter_mut() {
@@ -825,25 +891,25 @@ fn main() {
         }
         st.start.push(acc);
         st.evs.clear();
-        st.evs.resize(n, E2::default());
+        st.evs.resize(acc as usize, P::default());
         {
             let mut pos: Vec<u32> = st.start[..npeople as usize].to_vec();
             let mut i = 0;
-            for s in &s2 {
-                for e in s.out.iter(q) {
+            each(&s1_ev, q, |e| {
+                if e.dead == 0 {
                     let id = st.pid[i] as usize;
                     st.evs[pos[id] as usize] = *e;
                     pos[id] += 1;
                     i += 1;
                 }
-            }
+            });
         }
         // Clicks of these people, grouped the same way.
         st.cstart.clear();
         st.cstart.resize(npeople as usize + 1, 0);
         st.pid.clear();
-        for s in &s1_cl {
-            for c in s.iter(q) {
+        each(&s1_cl, q, |c| {
+            {
                 let mut k = (mix64(c.pkey) as usize) & mask;
                 let id = loop {
                     let key = st.local[k];
@@ -860,7 +926,7 @@ fn main() {
                     st.cstart[id as usize] += 1;
                 }
             }
-        }
+        });
         let mut acc = 0u32;
         for c in st.cstart.iter_mut() {
             let v = *c;
@@ -872,16 +938,14 @@ fn main() {
         {
             let mut pos: Vec<u32> = st.cstart[..npeople as usize].to_vec();
             let mut i = 0;
-            for s in &s1_cl {
-                for c in s.iter(q) {
-                    let id = st.pid[i];
-                    i += 1;
-                    if id != u32::MAX {
-                        st.cls[pos[id as usize] as usize] = *c;
-                        pos[id as usize] += 1;
-                    }
+            each(&s1_cl, q, |c| {
+                let id = st.pid[i];
+                i += 1;
+                if id != u32::MAX {
+                    st.cls[pos[id as usize] as usize] = *c;
+                    pos[id as usize] += 1;
                 }
-            }
+            });
         }
         let evs = std::mem::take(&mut st.evs);
         let cls = std::mem::take(&mut st.cls);
@@ -904,11 +968,21 @@ fn main() {
         st.cls = cls;
     });
 
-    fn person(st: &mut S3, ctx: &Ctx, store: &Store, evs: &[E2], cls: &[C1], ncamp: usize) {
+    fn each<T: Copy>(v: &[Scatter<T>], q: usize, mut f: impl FnMut(&T)) {
+        for s in v {
+            for b in s.blocks(q) {
+                for r in b {
+                    f(r);
+                }
+            }
+        }
+    }
+
+    fn person(st: &mut S3, ctx: &Ctx, store: &Store, evs: &[P], cls: &[C1], ncamp: usize) {
         let name = if evs[0].pkey & LINKED != 0 {
             ctx.comp_name[(evs[0].pkey & !LINKED) as usize].load(Relaxed)
         } else {
-            evs[0].uptr
+            Store::field_name(evs[0].gp & M40)
         };
         let ndays = ctx.ndays;
         let mut lo = 0usize;
@@ -951,12 +1025,13 @@ fn main() {
             while j < evs.len() && evs[j].ts - prev <= GAP {
                 let e = &evs[j];
                 prev = e.ts;
-                if e.price > 0 {
+                let price = e.price();
+                if price > 0 {
                     purchase = true;
-                    revenue += e.price as u64;
-                    match st.cats.iter_mut().find(|(c, _)| *c == e.cat) {
-                        Some(x) => x.1 += e.price as u64,
-                        None => st.cats.push((e.cat, e.price as u64)),
+                    revenue += price as u64;
+                    match st.cats.iter_mut().find(|(c, _)| *c == e.cat as u32) {
+                        Some(x) => x.1 += price as u64,
+                        None => st.cats.push((e.cat as u32, price as u64)),
                     }
                 }
                 j += 1;
@@ -1007,7 +1082,7 @@ fn main() {
         }
         flush(st, cur_day, d_sessions, d_events, d_revenue);
     }
-    std::mem::forget((s2, s1_cl));
+    std::mem::forget((s1_ev, s1_cl, pool));
     lap("pass 3: sessions");
 
     // ---- output
@@ -1048,4 +1123,33 @@ fn main() {
     lap("output");
     // Exit without unmapping or freeing: the kernel does it faster.
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ingest_order_and_keys() {
+        let a = ingest_secs(b"2026-10-03T23:58:10Z");
+        assert_eq!(a, ingest_secs(b"1791071890000"));
+        assert!(ingest_secs(b"2026-10-03T23:58:11Z") == a + 1);
+        assert!(ingest_secs(b"0000-01-01T00:00:00Z") < ingest_secs(b"1969-12-31T23:59:59Z"));
+        assert!(ingest_secs(b"9999-12-31T23:59:59Z") < M40);
+        assert_eq!(ingest_secs(b"nope"), M40);
+        assert_eq!((a as i64 - 62_167_219_200) * 1000, 1_791_071_890_000);
+        let h = xxh3_128(b"e1");
+        let k1 = K::new(h, 5);
+        let mut k2 = K::new(h, 9);
+        k2.w2 |= 0x7fff_1234_5678;
+        assert!(k1.same(&k2) && k1.ingest() == 5 && k2.ingest() == 9);
+        assert!(!k1.same(&K::new(h ^ (1 << 100), 5)));
+        assert!(!k1.same(&K::new(h ^ (1 << 70), 5)));
+        assert!(!k1.same(&K::new(h ^ 1, 5)));
+        let mut p = P::default();
+        let kp = K { w2: (k1.w2 & !M48) | (&mut p as *mut P as u64), ..k1 };
+        kp.kill();
+        assert_eq!(p.dead, 1);
+        K::new(h, 1).kill(); // null: no-op
+    }
 }
